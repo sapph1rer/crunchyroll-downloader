@@ -160,6 +160,7 @@ Decryption needs a Widevine device, which you must provide yourself. The tool ac
 
 If both are present, the `.wvd` file is used. The tool looks in the folder you run it from first, then in the folder that
 contains the program.
+for **`client_id.bin`** and **`private_key.pem`** search "ready to use cdms" and you'll find plenty of websites providing those files.
 
 ---
 
