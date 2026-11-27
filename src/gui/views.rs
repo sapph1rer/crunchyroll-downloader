@@ -1346,19 +1346,27 @@ fn series_detail<'a>(app: &'a App, item: &'a engine::CatalogItem) -> Element<'a,
 
     let poster_url = item.poster_large.as_ref().or(item.poster.as_ref());
     let description = if item.description.is_empty() { "No description." } else { item.description.as_str() };
-    let header = card(
-        row![
-            poster_view(app, poster_url, 200.0, 300.0),
-            column![
-                text(item.title.as_str()).size(26).font(theme::bold()).color(theme::text()),
-                text(series_facts(item)).size(14).color(theme::accent()).font(theme::medium()),
-                text(description).size(14).color(theme::muted()),
-            ]
-            .spacing(10)
-            .width(Length::Fill),
-        ]
-        .spacing(24),
-    );
+    let mut info = column![
+        text(item.title.as_str()).size(26).font(theme::bold()).color(theme::text()),
+        text(series_facts(item)).size(14).color(theme::accent()).font(theme::medium()),
+        text(description).size(14).color(theme::muted()),
+    ]
+    .spacing(10)
+    .width(Length::Fill);
+    // Which dubs and subtitles exist, by name (e.g. "Japanese, English").
+    for (label, locales) in [("Audio", &item.audio_locales), ("Subtitles", &item.subtitle_locales)] {
+        if !locales.is_empty() {
+            let names = locales.iter().map(|l| track_title(l)).collect::<Vec<_>>().join(", ");
+            info = info.push(
+                row![
+                    text(label).size(14).font(theme::medium()).color(theme::text()).width(Length::Fixed(80.0)),
+                    text(names).size(14).color(theme::muted()).width(Length::Fill),
+                ]
+                .spacing(8),
+            );
+        }
+    }
+    let header = card(row![poster_view(app, poster_url, 200.0, 300.0), info].spacing(24));
 
     let mut page = column![back, header].spacing(16);
     if app.running {

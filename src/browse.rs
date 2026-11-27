@@ -33,6 +33,9 @@ pub struct CatalogItem {
     pub year: Option<i64>,
     pub dubbed: bool,
     pub subbed: bool,
+    /// Audio (dub) and subtitle locales, e.g. "ja-JP"; empty when the catalog doesn't say.
+    pub audio_locales: Vec<String>,
+    pub subtitle_locales: Vec<String>,
 }
 
 impl CatalogItem {
@@ -236,7 +239,17 @@ pub fn item(v: &Value) -> Option<CatalogItem> {
         year: int_of(meta, "series_launch_year").or_else(|| int_of(meta, "movie_release_year")),
         dubbed: meta.get("is_dubbed").and_then(Value::as_bool).unwrap_or(false),
         subbed: meta.get("is_subbed").and_then(Value::as_bool).unwrap_or(false),
+        audio_locales: strs_of(meta, "audio_locales"),
+        subtitle_locales: strs_of(meta, "subtitle_locales"),
     })
+}
+
+/// A list of non-empty strings, or empty when the field is missing or not a list.
+fn strs_of(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// A browse page: `{ total, data: [series...] }`. Returns the cards and the total available.
@@ -286,7 +299,8 @@ mod tests {
                 { "width": 480, "height": 720, "source": "https://img/x/format=auto/480.jpg" }
             ]]},
             "series_metadata": { "season_count": 2, "episode_count": 24, "series_launch_year": 2004,
-                                  "is_dubbed": true, "is_subbed": true }
+                                  "is_dubbed": true, "is_subbed": true,
+                                  "audio_locales": ["ja-JP", "en-US"], "subtitle_locales": ["en-US", "th-TH", ""] }
         })
     }
 
@@ -299,6 +313,8 @@ mod tests {
         assert_eq!(c.poster_large.as_deref(), Some("https://img/x/format=jpeg/480.jpg"));
         assert_eq!((c.season_count, c.episode_count, c.year), (Some(2), Some(24), Some(2004)));
         assert!(c.dubbed && c.subbed);
+        assert_eq!(c.audio_locales, ["ja-JP", "en-US"]);
+        assert_eq!(c.subtitle_locales, ["en-US", "th-TH"]);
         assert_eq!(c.link(), "https://www.crunchyroll.com/series/GY5V");
     }
 
@@ -307,6 +323,7 @@ mod tests {
         let c = item(&json!({ "id": "A", "type": "series", "title": "Bare" })).unwrap();
         assert_eq!(c.poster, None);
         assert_eq!(c.season_count, None);
+        assert!(c.audio_locales.is_empty() && c.subtitle_locales.is_empty());
         assert!(item(&json!({ "id": "", "title": "No id" })).is_none());
         assert!(item(&json!({ "id": "E1", "type": "episode", "title": "An episode" })).is_none());
     }
