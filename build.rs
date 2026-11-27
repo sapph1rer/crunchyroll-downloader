@@ -1,0 +1,12 @@
+// Puts the logo into the .exe files (Explorer, taskbar pin, Start menu).
+fn main() {
+    println!("cargo:rerun-if-changed=src/gui/assets/icon.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut r = winresource::WindowsResource::new();
+        r.set_icon("src/gui/assets/icon.ico");
+        if let Err(e) = r.compile() {
+            // No resource compiler (rc.exe / windres): the window still gets the logo at runtime.
+            println!("cargo:warning=exe icon not embedded: {e}");
+        }
+    }
+}

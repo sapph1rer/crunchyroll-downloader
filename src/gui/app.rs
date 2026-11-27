@@ -1,7 +1,7 @@
 //! App state, messages and update logic for the GUI.
 
 use crate::engine::Catalog;
-use crate::{engine, logs, theme, views};
+use crate::{engine, logs, theme, update, views};
 use crunchyroll_downloader::api::SeasonEpisode;
 use crunchyroll_downloader::backoff::parse_duration;
 use crunchyroll_downloader::episode::{episode_label, info_from_season_episode, Options};
@@ -249,6 +249,21 @@ pub struct App {
     pub last_output: Option<PathBuf>,
     /// When the user last touched the app. The vault locks after a set time without input.
     pub last_activity: Instant,
+    /// App updates from GitHub Releases (Settings › Updates).
+    pub update: UpdateState,
+}
+
+#[derive(Default)]
+pub struct UpdateState {
+    pub checking: bool,
+    /// A check ran this session (the automatic one runs once, at the first unlock).
+    pub checked: bool,
+    pub latest: Option<update::Release>,
+    pub error: Option<String>,
+    /// Install progress (fraction, negative when unknown) while downloading.
+    pub progress: Option<f32>,
+    /// Installed and waiting for a restart: the new program.
+    pub installed: Option<PathBuf>,
 }
 
 /// One-shot slot that carries an unlock result. Cloneable so `Message` can be Clone,
@@ -383,6 +398,13 @@ pub enum Message {
     Activity,
     /// Periodic check for the auto-lock.
     IdleCheck,
+    /// Look for a newer release (true = the user pressed Check now).
+    CheckUpdate(bool),
+    UpdateChecked(bool, Result<update::Release, String>),
+    InstallUpdate,
+    UpdateDl(update::UpdateEvent),
+    /// Start the installed version and close this one.
+    RestartUpdate,
 }
 
 impl App {
@@ -443,10 +465,19 @@ impl App {
             queue: Vec::new(),
             last_output: None,
             last_activity: Instant::now(),
+            update: UpdateState::default(),
         };
-        // Clear out temp files a crash or forced close left behind, in the background.
+        // Clear out temp files a crash or forced close left behind (and old program files
+        // an update moved aside), in the background.
         let clean = Task::perform(
-            async { tokio::task::spawn_blocking(clean_stale_temp).await.unwrap_or((0, 0)) },
+            async {
+                tokio::task::spawn_blocking(|| {
+                    update::clean_old();
+                    clean_stale_temp()
+                })
+                .await
+                .unwrap_or((0, 0))
+            },
             |(files, bytes)| Message::TempCleaned(files, bytes),
         );
         (app, Task::batch([focus_password(), clean]))
@@ -916,7 +947,10 @@ impl App {
                 match result {
                     Ok(vault) => {
                         self.open_vault(vault);
-                        return self.check_ffmpeg();
+                        // Look for a new version once per session, after the first unlock so
+                        // the notice lands on the main screen.
+                        let check = if self.update.checked { Task::none() } else { self.update(Message::CheckUpdate(false)) };
+                        return Task::batch([self.check_ffmpeg(), check]);
                     }
                     Err(e) => {
                         self.pw.zeroize();
@@ -1437,6 +1471,69 @@ impl App {
                 }
                 other => self.ffmpeg_dl = Some(other),
             },
+            Message::CheckUpdate(manual) => {
+                if self.update.checking {
+                    return Task::none();
+                }
+                self.update.checking = true;
+                self.update.checked = true;
+                self.update.error = None;
+                return Task::perform(update::latest(), move |r| Message::UpdateChecked(manual, r));
+            }
+            Message::UpdateChecked(manual, result) => {
+                self.update.checking = false;
+                match result {
+                    Ok(r) => {
+                        if r.is_newer() {
+                            ui::info(format!("Version {} is available (you have {})", r.tag, update::VERSION));
+                            if !manual && self.notice.is_none() {
+                                self.notice = Some((Kind::Info, format!("Version {} is out — install it in Settings › Updates.", r.tag)));
+                            }
+                        }
+                        self.update.latest = Some(r);
+                    }
+                    Err(e) => {
+                        ui::warn(format!("Update check failed: {e}"));
+                        // The automatic check stays quiet; Check now shows why.
+                        if manual {
+                            self.update.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Message::InstallUpdate => {
+                let Some(r) = self.update.latest.clone() else { return Task::none() };
+                if self.update.progress.is_some() || self.running {
+                    return Task::none();
+                }
+                self.update.progress = Some(0.0);
+                self.update.error = None;
+                ui::info(format!("Downloading version {}...", r.tag));
+                return Task::run(update::install_stream(r), Message::UpdateDl);
+            }
+            Message::UpdateDl(event) => match event {
+                update::UpdateEvent::Progress(p) => self.update.progress = Some(p),
+                update::UpdateEvent::Done(Ok(exe)) => {
+                    self.update.progress = None;
+                    ui::ok("Update installed. Restart to use it.");
+                    self.update.installed = Some(exe);
+                }
+                update::UpdateEvent::Done(Err(e)) => {
+                    self.update.progress = None;
+                    ui::warn(format!("Update failed: {e}"));
+                    self.update.error = Some(e);
+                }
+            },
+            Message::RestartUpdate => {
+                let Some(exe) = self.update.installed.clone() else { return Task::none() };
+                if self.running {
+                    return Task::none();
+                }
+                match std::process::Command::new(&exe).spawn() {
+                    Ok(_) => return iced::exit(),
+                    Err(e) => self.update.error = Some(format!("Could not start the new version: {e}")),
+                }
+            }
             Message::OpenSetup => {
                 self.setup_open = true;
                 self.setup_anim.go_mut(1.0, Instant::now());
@@ -2108,7 +2205,8 @@ fn download_ffmpeg_stream() -> impl futures::Stream<Item = FfmpegDlEvent> {
         let tmp_zip = std::env::temp_dir().join(format!("ffmpeg-dl-{}.zip", std::process::id()));
 
         let client = wreq::Client::new();
-        let resp = match client.get(FFMPEG_URL).send().await.and_then(|r| r.error_for_status()) {
+        // The download link answers with a redirect, which wreq does not follow by default.
+        let resp = match client.get(FFMPEG_URL).redirect(wreq::redirect::Policy::limited(10)).send().await.and_then(|r| r.error_for_status()) {
             Ok(r) => r,
             Err(e) => { yield FfmpegDlEvent::Done(Err(format!("download failed: {e}"))); return; }
         };

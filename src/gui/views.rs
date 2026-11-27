@@ -17,6 +17,7 @@ use iced::font::Font;
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, stack, text, text_input, toggler, Id, Space};
 use iced::{Alignment, Color, Element, Length, Padding, Task};
+use crate::update;
 use theme::icon;
 
 /// Locales offered in the language pickers, in display order.
@@ -1737,9 +1738,81 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
         .spacing(12),
     );
 
-    let left = column![languages, account, speed].spacing(20).width(Length::Fill);
+    let left = column![languages, account, speed, updates_card(app)].spacing(20).width(Length::Fill);
     let right = column![downloads, quality, ffmpeg_card, advanced].spacing(20).width(Length::Fill);
     column![row![left, right].spacing(20), password].spacing(20).into()
+}
+
+/// Settings › Updates: this version, Check now, and installing a newer release.
+fn updates_card(app: &App) -> Element<'_, Message> {
+    let u = &app.update;
+    let check = button(
+        row![icon(theme::UPDATE, 18.0), text(if u.checking { "Checking…" } else { "Check now" }).size(14).font(theme::medium())]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .on_press_maybe((!u.checking && u.progress.is_none()).then_some(Message::CheckUpdate(true)))
+    .style(theme::tonal)
+    .padding([12, 16]);
+
+    let mut body = column![row![
+        text(format!("You have version {}", update::VERSION)).size(14).color(theme::text()).width(Length::Fill),
+        check,
+    ]
+    .align_y(Alignment::Center)]
+    .spacing(12);
+
+    match &u.latest {
+        Some(r) if r.is_newer() => {
+            body = body.push(text(format!("Version {} is available", r.tag)).size(15).font(theme::medium()).color(theme::accent()));
+            // What changed: the first lines of the release notes.
+            let notes: Vec<&str> = r.notes.lines().map(str::trim).filter(|l| !l.is_empty()).take(6).collect();
+            if !notes.is_empty() {
+                body = body.push(text(notes.join("\n")).size(13).color(theme::muted()));
+            }
+            if let Some(p) = u.progress {
+                body = body.push(text("Downloading the update…").size(13).color(theme::muted()));
+                body = body.push(progress_bar(0.0..=1.0, p.max(0.0)).girth(8).style(theme::progress));
+            } else if u.installed.is_some() {
+                body = body.push(
+                    row![
+                        text("Installed — restart to use it.").size(14).color(theme::success()).width(Length::Fill),
+                        button(text("Restart now").size(14).font(theme::medium()))
+                            .on_press_maybe((!app.running).then_some(Message::RestartUpdate))
+                            .style(theme::filled)
+                            .padding([12, 18]),
+                    ]
+                    .align_y(Alignment::Center),
+                );
+            } else if update::dev_build() {
+                body = body.push(
+                    text(format!("This copy runs from cargo's target folder — update it with git, or download it from {}", r.page))
+                        .size(13)
+                        .color(theme::muted()),
+                );
+            } else {
+                body = body.push(
+                    button(
+                        row![icon(theme::DOWNLOAD, 18.0), text(format!("Download and install {}", r.tag)).size(14).font(theme::medium())]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                    )
+                    .on_press_maybe((!app.running).then_some(Message::InstallUpdate))
+                    .style(theme::filled)
+                    .padding([12, 18]),
+                );
+                if app.running {
+                    body = body.push(text("Available when the current download finishes.").size(13).color(theme::muted()));
+                }
+            }
+        }
+        Some(r) => body = body.push(text(format!("Up to date (newest: {})", r.tag)).size(13).color(theme::success())),
+        None => {}
+    }
+    if let Some(e) = &u.error {
+        body = body.push(text(e.as_str()).size(13).color(theme::danger()));
+    }
+    settings_card(section_head(theme::UPDATE, "Updates", "New versions come from the project's GitHub releases"), body)
 }
 
 /// The setup panel. It fades in and slides up while it opens or closes. It says where each

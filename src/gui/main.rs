@@ -6,6 +6,7 @@ mod dropdown;
 mod engine;
 mod logs;
 mod theme;
+mod update;
 mod views;
 
 fn main() -> iced::Result {

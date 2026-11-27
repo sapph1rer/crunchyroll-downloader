@@ -33,6 +33,7 @@ pub const MOVIE: char = '\u{e02c}';
 pub const LOGIN: char = '\u{ea77}';
 pub const LOGOUT: char = '\u{e9ba}';
 pub const HOURGLASS: char = '\u{e88b}';
+pub const UPDATE: char = '\u{e923}';
 
 /// An icon glyph as a text widget. Set the color with `.color(..)`.
 pub fn icon<'a>(glyph: char, size: f32) -> iced::widget::Text<'a> {

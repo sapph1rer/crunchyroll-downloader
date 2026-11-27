@@ -9,7 +9,7 @@
 # are: WebViewBuilder construction, web-context attach, and cookies_for_url.
 [package]
 name = "cr-login-helper"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -20,3 +20,6 @@ path = "src/main.rs"
 wry = "0.52"
 tao = "0.31"
 zeroize = "1"
+
+[build-dependencies]
+winresource = "0.1"

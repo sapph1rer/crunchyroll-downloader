@@ -148,6 +148,12 @@ library crate (src/lib.rs)  ◄── crunchyroll-downloader (CLI, clap)
 | `theme` | **All** colors, icons (Material Symbols codepoints), widget styles. Accent `#F47521`. |
 | `dropdown` | Overlay list widget used by `select`. |
 | `logs` | Log buffer for the Logs tab. |
+| `update` | App updates (Settings › Updates): GitHub latest release → `crunchyroll-downloader-windows-x64.zip` checked against its `.sha256` → old files renamed `*.old-N` (removed at next start) → new files copied → restart. Checked once per session after unlock. |
+
+**Releasing:** bump `version` in `Cargo.toml` and `login-helper/Cargo.toml`, then
+`powershell -ExecutionPolicy Bypass -File scripts\make-release.ps1 -Notes "..."`. A release
+without the zip + `.sha256` is not installable by the updater. The exe icon is
+`src/gui/assets/icon.ico` (embedded by `build.rs` / `login-helper/build.rs`).
 
 ### `login-helper/`
 Separate process so WebView2's event loop never collides with iced's. Opens

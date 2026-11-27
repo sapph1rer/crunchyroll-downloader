@@ -1,6 +1,6 @@
 [package]
 name = "crunchyroll-downloader"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Downloads anime from Crunchyroll and outputs them as MKV (Rust port of CuteTenshii/crunchyroll-downloader)"
@@ -48,6 +48,10 @@ png = { version = "0.17", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 async-stream = { version = "0.3", optional = true }
 notify-rust = { version = "4", optional = true }
+
+[build-dependencies]
+# puts src/gui/assets/icon.ico into the .exe files
+winresource = "0.1"
 
 [features]
 default = ["gui"]
