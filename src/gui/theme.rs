@@ -1,5 +1,5 @@
-//! Material 3–style dark theme in blue. Surfaces are tonal steps above the background,
-//! corners are large and rounded, and the accent is a soft blue.
+//! Material 3–style dark theme in Crunchyroll orange. Surfaces are near-neutral dark
+//! steps above a black background, and the accent is Crunchyroll's orange (#F47521).
 
 use iced::font::{Family, Weight};
 use iced::theme::Palette;
@@ -27,6 +27,12 @@ pub const LANGUAGE: char = '\u{e894}';
 pub const TUNE: char = '\u{e429}';
 pub const SEARCH: char = '\u{e8b6}';
 pub const CHECK: char = '\u{e5ca}';
+pub const EXPLORE: char = '\u{e87a}';
+pub const ARROW_BACK: char = '\u{e5c4}';
+pub const MOVIE: char = '\u{e02c}';
+pub const LOGIN: char = '\u{ea77}';
+pub const LOGOUT: char = '\u{e9ba}';
+pub const HOURGLASS: char = '\u{e88b}';
 
 /// An icon glyph as a text widget. Set the color with `.color(..)`.
 pub fn icon<'a>(glyph: char, size: f32) -> iced::widget::Text<'a> {
@@ -44,62 +50,65 @@ pub fn medium() -> Font {
 }
 
 pub fn background() -> Color {
-    Color::from_rgb8(0x0E, 0x16, 0x20)
+    Color::from_rgb8(0x0F, 0x0F, 0x12)
 }
 /// Navigation rail and the lowest surface.
 pub fn rail_color() -> Color {
-    Color::from_rgb8(0x0B, 0x12, 0x1A)
+    Color::from_rgb8(0x09, 0x09, 0x0C)
 }
 /// Cards.
 pub fn surface() -> Color {
-    Color::from_rgb8(0x16, 0x22, 0x2E)
+    Color::from_rgb8(0x1A, 0x1A, 0x1F)
 }
 /// Inputs and nested panels.
 pub fn surface_high() -> Color {
-    Color::from_rgb8(0x1E, 0x2C, 0x3A)
+    Color::from_rgb8(0x24, 0x24, 0x2B)
 }
 /// Buttons that sit on a card.
 pub fn surface_highest() -> Color {
-    Color::from_rgb8(0x29, 0x39, 0x49)
+    Color::from_rgb8(0x30, 0x30, 0x39)
 }
 pub fn outline() -> Color {
-    Color::from_rgb8(0x3D, 0x50, 0x63)
+    Color::from_rgb8(0x45, 0x45, 0x50)
 }
+/// Crunchyroll orange.
 pub fn accent() -> Color {
-    Color::from_rgb8(0xA8, 0xC8, 0xFF)
+    Color::from_rgb8(0xF4, 0x75, 0x21)
 }
+/// Near-black, for text and icons that sit on the orange accent.
 pub fn on_accent() -> Color {
-    Color::from_rgb8(0x08, 0x25, 0x4A)
+    Color::from_rgb8(0x24, 0x11, 0x00)
 }
+/// A deep, muted orange for selected chips and the nav pill.
 pub fn accent_container() -> Color {
-    Color::from_rgb8(0x2B, 0x4A, 0x72)
+    Color::from_rgb8(0x4A, 0x2A, 0x10)
 }
 pub fn on_accent_container() -> Color {
-    Color::from_rgb8(0xD7, 0xE6, 0xFF)
+    Color::from_rgb8(0xFF, 0xD8, 0xB4)
 }
 pub fn text() -> Color {
-    Color::from_rgb8(0xE2, 0xEA, 0xF3)
+    Color::from_rgb8(0xED, 0xEA, 0xE6)
 }
 pub fn muted() -> Color {
-    Color::from_rgb8(0x9C, 0xAE, 0xC0)
+    Color::from_rgb8(0xA6, 0xA2, 0x9C)
 }
 pub fn success() -> Color {
-    Color::from_rgb8(0xA6, 0xE3, 0xB9)
+    Color::from_rgb8(0x9A, 0xE0, 0xA8)
 }
 pub fn warning() -> Color {
-    Color::from_rgb8(0xF5, 0xD0, 0x8A)
+    Color::from_rgb8(0xF5, 0xC9, 0x7A)
 }
 pub fn danger() -> Color {
-    Color::from_rgb8(0xFF, 0xB4, 0xAB)
+    Color::from_rgb8(0xFF, 0xB0, 0x9C)
 }
 pub fn danger_container() -> Color {
-    Color::from_rgb8(0x5C, 0x1F, 0x1C)
+    Color::from_rgb8(0x5C, 0x24, 0x1A)
 }
 
 /// The application theme.
 pub fn theme() -> Theme {
     Theme::custom(
-        "Material You Blue".to_string(),
+        "Crunchyroll Orange".to_string(),
         Palette {
             background: background(),
             text: text(),
@@ -158,6 +167,36 @@ pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
         _ => Color::TRANSPARENT,
     };
     button_style(bg, accent(), status, 22.0)
+}
+
+/// A Browse poster card: no fill at rest, a soft surface lift on hover so the grid stays
+/// calm but clearly clickable.
+pub fn poster_card(_: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => surface_high(),
+        button::Status::Pressed => surface_highest(),
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: text(),
+        border: Border { radius: 14.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The grey box shown while a poster loads, or when it has none.
+pub fn poster_placeholder(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(surface_high())),
+        border: Border { radius: 10.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// A sort/filter choice: filled orange when selected, a quiet chip otherwise.
+pub fn choice(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| if selected { filled(theme, status) } else { tonal(theme, status) }
 }
 
 /// Small selectable chip, for chosen languages.
@@ -289,11 +328,10 @@ pub fn toggle(_: &Theme, status: toggler::Status) -> toggler::Style {
     }
 }
 
-/// One log line: a soft rounded row sitting on the log card.
-pub fn log_row(_: &Theme) -> container::Style {
+/// A thin horizontal divider between flat list rows (e.g. log lines).
+pub fn divider(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(surface_high())),
-        border: Border { radius: 14.0.into(), ..Default::default() },
+        background: Some(Background::Color(Color { a: 0.14, ..outline() })),
         ..Default::default()
     }
 }

@@ -129,6 +129,29 @@ pub fn is_rate_limited(e: &anyhow::Error) -> bool {
     matches!(e.downcast_ref::<ApiError>(), Some(ApiError::RateLimited))
 }
 
+/// Where a finished episode is saved:
+/// `<output>/<Series>/<Series> S01E02 - <Title> [<quality>].mkv`, or for a film
+/// `<output>/<Listing>/<Title> [<quality>].mkv`.
+/// Shared with the GUI, so it can mark episodes that are already on disk.
+pub fn output_path(
+    output_dir: &std::path::Path,
+    series_title: &str,
+    season: i64,
+    episode: i64,
+    title: &str,
+    quality: &str,
+    is_movie: bool,
+) -> PathBuf {
+    let series = sanitize_filename(series_title);
+    let title = sanitize_filename(title);
+    let name = if is_movie {
+        format!("{title} [{quality}].mkv")
+    } else {
+        format!("{series} S{season:02}E{episode:02} - {title} [{quality}].mkv")
+    };
+    output_dir.join(&series).join(name)
+}
+
 /// Downloads one episode. Returns Err on failure; rate-limit errors are
 /// detectable with `is_rate_limited`.
 pub async fn download_episode(
@@ -138,18 +161,20 @@ pub async fn download_episode(
     info: &EpisodeInfo,
     opts: &Options,
 ) -> Result<Outcome> {
-    let series = sanitize_filename(&info.episode_metadata.series_title);
-    let title = sanitize_filename(&info.title);
-    let dir = opts.output_dir.join(&series);
-    if tokio::fs::metadata(&dir).await.is_err() {
-        let _ = tokio::fs::create_dir_all(&dir).await;
-    }
-    let output = dir.join(format!(
-        "{series} S{:02}E{:02} - {title} [{}].mkv",
+    let output = output_path(
+        &opts.output_dir,
+        &info.episode_metadata.series_title,
         info.episode_metadata.season_number,
         info.episode_metadata.episode_number,
-        opts.video_quality
-    ));
+        &info.title,
+        &opts.video_quality,
+        info.episode_metadata.is_movie,
+    );
+    if let Some(dir) = output.parent() {
+        if tokio::fs::metadata(dir).await.is_err() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
+    }
     if output.exists() {
         return Ok(Outcome::Skipped("already downloaded".into()));
     }
@@ -290,7 +315,8 @@ async fn download_versions(
         .chain(cc_langs.iter().map(|l| (l.clone(), captions[l].clone(), true)))
         .collect();
     let sub_fut = try_join_all(sub_jobs.iter().map(|(locale, sub, is_cc)| {
-        let http = api.http().clone();
+        // Subtitles are small text files — use the direct CDN client.
+        let http = api.cdn_http().clone();
         let (locale, format, url, is_cc) = (locale.clone(), sub_format(sub), sub.url.clone(), *is_cc);
         async move {
             let file = download_subs(&http, &url, &format)
@@ -311,14 +337,16 @@ async fn download_versions(
             let _slot = track_gate.acquire().await.map_err(|e| anyhow!("{e}"))?;
             let (manifest, keys) = keys_for_playback(api, ep, guid, locale).await?;
             let workers = opts.segment_workers;
+            // CDN segments bypass the proxy for maximum download speed.
+            let cdn = api.cdn_http();
             let (video, audio) = if i == 0 {
                 let (v, a) = tokio::try_join!(
-                    download_track(api.http(), &manifest, true, &opts.video_quality, locale, &keys, workers),
-                    download_track(api.http(), &manifest, false, &opts.audio_quality, locale, &keys, workers),
+                    download_track(cdn, &manifest, true, &opts.video_quality, locale, &keys, workers),
+                    download_track(cdn, &manifest, false, &opts.audio_quality, locale, &keys, workers),
                 )?;
                 (Some(v), a)
             } else {
-                (None, download_track(api.http(), &manifest, false, &opts.audio_quality, locale, &keys, workers).await?)
+                (None, download_track(cdn, &manifest, false, &opts.audio_quality, locale, &keys, workers).await?)
             };
             if let Err(e) = api.delete_stream(guid, &ep.token).await {
                 crate::say!("Failed to remove the player stream for {locale}: {e}");
@@ -417,6 +445,9 @@ fn first_line(s: &str) -> &str {
 
 /// Label used in messages, for example "S02E01 Title".
 pub fn episode_label(info: &EpisodeInfo) -> String {
+    if info.episode_metadata.is_movie {
+        return format!("Movie: {}", info.title);
+    }
     format!(
         "S{:02}E{:02} {}",
         info.episode_metadata.season_number, info.episode_metadata.episode_number, info.title
@@ -580,6 +611,7 @@ pub fn info_from_season_episode(ep: &SeasonEpisode) -> EpisodeInfo {
             series_title: ep.series_title.clone(),
             availability_starts: ep.availability_starts.clone(),
             versions: ep.versions.clone(),
+            is_movie: ep.is_movie,
         },
         title: ep.title.clone(),
     }
@@ -590,6 +622,14 @@ pub fn info_from_season_episode(ep: &SeasonEpisode) -> EpisodeInfo {
 mod tests {
     use super::*;
     use crate::api::{DubVersion, EpisodeMetadata};
+
+    #[test]
+    fn output_path_layout() {
+        let p = output_path(std::path::Path::new("out"), "Paranoia Agent", 1, 3, "Double Lips", "1080p", false);
+        assert_eq!(p, std::path::Path::new("out").join("Paranoia Agent").join("Paranoia Agent S01E03 - Double Lips [1080p].mkv"));
+        let m = output_path(std::path::Path::new("out"), "Akira", 0, 1, "Akira", "1080p", true);
+        assert_eq!(m, std::path::Path::new("out").join("Akira").join("Akira [1080p].mkv"));
+    }
 
     fn sub(language: &str, format: &str, url: &str) -> Option<Subtitle> {
         Some(Subtitle { language: language.into(), format: format.into(), url: url.into() })
@@ -618,6 +658,7 @@ mod tests {
                     .iter()
                     .map(|(l, g)| DubVersion { audio_locale: l.to_string(), guid: g.to_string() })
                     .collect(),
+                is_movie: false,
             },
             title: "Episode".into(),
         }

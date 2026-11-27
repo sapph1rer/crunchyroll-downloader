@@ -30,10 +30,29 @@ pub enum ApiError {
     Other(#[from] anyhow::Error),
 }
 
+/// Builds a wreq::Client with optional Firefox emulation and optional proxy.
+/// `with_emulation` should be true for API calls (needs Cloudflare bypass),
+/// false for CDN segment downloads (no emulation needed → faster).
+pub fn build_client(proxy_url: Option<&str>, with_emulation: bool) -> Result<wreq::Client, wreq::Error> {
+    let mut b = wreq::Client::builder().user_agent(USER_AGENT);
+    if with_emulation {
+        b = b.emulation(wreq_util::Emulation::Firefox147);
+    }
+    if let Some(url) = proxy_url.filter(|s| !s.is_empty()) {
+        if let Ok(proxy) = wreq::Proxy::all(url) {
+            b = b.proxy(proxy);
+        }
+    }
+    b.build()
+}
+
 /// Shared client: holds the bearer token and can refresh it on 401.
+/// Also exposes a separate CDN client that bypasses the proxy for speed.
 #[derive(Clone)]
 pub struct Api {
     http: wreq::Client,
+    /// Direct client for CDN segment downloads — no proxy, no emulation.
+    cdn_http: wreq::Client,
     etp_rt: Arc<String>,
     device_id: Arc<String>,
     token: Arc<RwLock<String>>,
@@ -42,23 +61,28 @@ pub struct Api {
 
 impl Api {
     pub async fn login(etp_rt: String) -> Result<Self, ApiError> {
-        Self::login_at(TOKEN_URL, etp_rt).await
+        Self::login_at(TOKEN_URL, etp_rt, None).await
+    }
+
+    pub async fn login_with_proxy(etp_rt: String, proxy_url: &str) -> Result<Self, ApiError> {
+        Self::login_at(TOKEN_URL, etp_rt, Some(proxy_url)).await
     }
 
     /// Like `login`, but fetches the token from `token_url`.
-    pub async fn login_at(token_url: &str, etp_rt: String) -> Result<Self, ApiError> {
+    pub async fn login_at(token_url: &str, etp_rt: String, proxy_url: Option<&str>) -> Result<Self, ApiError> {
         let device_id = uuid::Uuid::new_v4().to_string();
         // Firefox emulation gives the same TLS and HTTP/2 fingerprint as a real Firefox
         // (the same one the User-Agent claims). Cloudflare checks this, and rustls and
         // native-tls both fail its bot check.
-        let http = wreq::Client::builder()
-            .emulation(wreq_util::Emulation::Firefox147)
-            .user_agent(USER_AGENT)
-            .build()
+        // The API client uses the proxy; the CDN client goes direct for maximum throughput.
+        let http = build_client(proxy_url, true)
+            .map_err(|e| ApiError::Other(e.into()))?;
+        let cdn_http = build_client(None, false)
             .map_err(|e| ApiError::Other(e.into()))?;
         let token = fetch_token(&http, token_url, &device_id, &etp_rt).await?;
         Ok(Self {
             http,
+            cdn_http,
             etp_rt: Arc::new(etp_rt),
             device_id: Arc::new(device_id),
             token: Arc::new(RwLock::new(token)),
@@ -66,8 +90,14 @@ impl Api {
         })
     }
 
+    /// The API client (goes through proxy when configured).
     pub fn http(&self) -> &wreq::Client {
         &self.http
+    }
+
+    /// The CDN client (always direct, bypasses proxy for fast segment downloads).
+    pub fn cdn_http(&self) -> &wreq::Client {
+        &self.cdn_http
     }
 
     pub async fn bearer(&self) -> String {
@@ -115,6 +145,33 @@ impl Api {
         serde_json::from_str(&text).with_context(|| format!("decoding {url}"))
     }
 
+    /// One page of the catalog, ordered by `sort`. Returns the cards and the total available.
+    pub async fn browse(
+        &self,
+        sort: crate::browse::Sort,
+        show: crate::browse::Show,
+        genre: Option<&str>,
+        start: usize,
+        n: usize,
+        locale: &str,
+    ) -> Result<(Vec<crate::browse::CatalogItem>, usize)> {
+        let url = crate::browse::browse_url(sort, show, genre, start, n, locale);
+        let v: serde_json::Value = self.get_json(&url).await?;
+        Ok(crate::browse::parse_browse(&v))
+    }
+
+    /// The genres the catalog can be filtered by.
+    pub async fn genres(&self, locale: &str) -> Result<Vec<crate::browse::Genre>> {
+        let v: serde_json::Value = self.get_json(&crate::browse::categories_url(locale)).await?;
+        Ok(crate::browse::parse_categories(&v))
+    }
+
+    /// Series matching a search, best matches first.
+    pub async fn search(&self, query: &str, n: usize, locale: &str) -> Result<Vec<crate::browse::CatalogItem>> {
+        let v: serde_json::Value = self.get_json(&crate::browse::search_url(query, n, locale)).await?;
+        Ok(crate::browse::parse_search(&v))
+    }
+
     pub async fn seasons(&self, series_id: &str, audio: &str, subs: &str) -> Result<Vec<Season>> {
         let url = format!(
             "https://www.crunchyroll.com/content/v2/cms/series/{series_id}/seasons?force_locale=&preferred_audio_language={audio}&locale={subs}"
@@ -136,15 +193,57 @@ impl Api {
         Ok(v.data)
     }
 
+    /// Metadata of one playable item from a /watch/ link: a series episode, or a film (whose
+    /// object carries `movie_metadata` instead of `episode_metadata`).
     pub async fn episode_info(&self, id: &str) -> Result<EpisodeInfo> {
         let url = format!(
             "https://www.crunchyroll.com/content/v2/cms/objects/{id}?ratings=true&preferred_audio_language=ja-JP&locale=en-US"
         );
-        let v: DataWrap<EpisodeInfo> = self.get_json(&url).await?;
-        v.data
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no metadata returned for {id}"))
+        let v: serde_json::Value = self.get_json(&url).await?;
+        let obj = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .ok_or_else(|| anyhow!("no metadata returned for {id}"))?;
+        if obj.get("episode_metadata").is_some() {
+            return serde_json::from_value(obj.clone()).with_context(|| format!("decoding episode {id}"));
+        }
+        let ep = movie_episode(obj, 1, "").ok_or_else(|| anyhow!("{id} is neither an episode nor a movie"))?;
+        Ok(crate::episode::info_from_season_episode(&ep))
+    }
+
+    /// The films of a movie listing, as "episodes" of it (so they download exactly like
+    /// episodes), with the listing's title.
+    pub async fn movie_listing(&self, listing_id: &str, audio: &str, subs: &str) -> Result<(String, Vec<SeasonEpisode>)> {
+        let base = format!("https://www.crunchyroll.com/content/v2/cms/movie_listings/{listing_id}");
+        let query = format!("preferred_audio_language={audio}&locale={subs}");
+        let head: serde_json::Value = self.get_json(&format!("{base}?{query}")).await?;
+        let listing_title = head
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|o| o.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let movies: serde_json::Value = self.get_json(&format!("{base}/movies?{query}")).await?;
+        let films: Vec<SeasonEpisode> = movies
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| movie_episode(m, i as i64 + 1, &listing_title))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let title = if listing_title.is_empty() {
+            films.first().map(|f| f.series_title.clone()).unwrap_or_default()
+        } else {
+            listing_title
+        };
+        Ok((title, films))
     }
 
     /// Fetches playback info for one dub GUID.
@@ -305,6 +404,58 @@ pub struct SeasonEpisode {
     #[serde(default)]
     #[allow(dead_code)]
     pub availability_starts: String,
+    /// A film from a movie listing rather than a series episode (set by this program).
+    #[serde(default)]
+    pub is_movie: bool,
+}
+
+/// Reads a film object (from `/objects/{id}` or a listing's `/movies`) as episode `index`
+/// of its listing. Metadata may sit in `movie_metadata` or on the object itself. When the
+/// object names no dub versions and no audio locale, Japanese is assumed, so the film's own
+/// id is used for playback.
+pub fn movie_episode(v: &serde_json::Value, index: i64, listing_title: &str) -> Option<SeasonEpisode> {
+    use serde_json::Value;
+    let text = |o: &Value, k: &str| o.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    let kind = text(v, "type");
+    if !kind.is_empty() && kind != "movie" {
+        return None;
+    }
+    let id = text(v, "id");
+    let title = text(v, "title");
+    if id.is_empty() || title.is_empty() {
+        return None;
+    }
+    let meta = v.get("movie_metadata").unwrap_or(v);
+    let versions: Vec<DubVersion> = meta
+        .get("versions")
+        .or_else(|| v.get("versions"))
+        .and_then(|x| serde_json::from_value(x.clone()).ok())
+        .unwrap_or_default();
+    let mut audio_locale = text(meta, "audio_locale");
+    if audio_locale.is_empty() {
+        audio_locale = text(v, "audio_locale");
+    }
+    if audio_locale.is_empty() && versions.is_empty() {
+        audio_locale = "ja-JP".into();
+    }
+    let mut series_title = text(meta, "movie_listing_title");
+    if series_title.is_empty() {
+        series_title = text(v, "movie_listing_title");
+    }
+    if series_title.is_empty() {
+        series_title = if listing_title.is_empty() { title.clone() } else { listing_title.to_string() };
+    }
+    Some(SeasonEpisode {
+        id,
+        versions,
+        season_number: 0,
+        episode_number: index,
+        series_title,
+        audio_locale,
+        title,
+        availability_starts: String::new(),
+        is_movie: true,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +476,9 @@ pub struct EpisodeMetadata {
     pub availability_starts: String,
     #[serde(default)]
     pub versions: Vec<DubVersion>,
+    /// A film rather than a series episode (set by this program).
+    #[serde(default)]
+    pub is_movie: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -484,6 +638,7 @@ mod http_tests {
     fn client_with_token(token_url: &str, token: &str) -> Api {
         Api {
             http: wreq::Client::new(),
+            cdn_http: wreq::Client::new(),
             etp_rt: Arc::new("cookie".into()),
             device_id: Arc::new("device".into()),
             token: Arc::new(RwLock::new(token.into())),
@@ -608,5 +763,46 @@ mod http_tests {
             assert_eq!(ep.error.as_deref().unwrap_or(""), want_err, "error for {json}");
             assert_eq!(ep.reason.as_deref().unwrap_or(""), want_reason, "reason for {json}");
         }
+    }
+}
+
+#[cfg(test)]
+mod movie_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_a_film_with_versions() {
+        let v = json!({
+            "id": "G25FVD45Q", "type": "movie", "title": "The Movie",
+            "movie_metadata": {
+                "movie_listing_title": "Some Listing",
+                "versions": [
+                    { "audio_locale": "ja-JP", "guid": "G25FVD45Q", "original": true },
+                    { "audio_locale": "en-US", "guid": "GEN123" }
+                ]
+            }
+        });
+        let ep = movie_episode(&v, 1, "").unwrap();
+        assert!(ep.is_movie);
+        assert_eq!(ep.series_title, "Some Listing");
+        assert_eq!(ep.versions.len(), 2);
+        assert_eq!((ep.season_number, ep.episode_number), (0, 1));
+    }
+
+    #[test]
+    fn a_bare_film_plays_its_own_id_in_japanese() {
+        let v = json!({ "id": "M1", "title": "Bare Film" });
+        let ep = movie_episode(&v, 2, "Listing").unwrap();
+        assert_eq!(ep.audio_locale, "ja-JP");
+        assert_eq!(ep.series_title, "Listing");
+        let info = crate::episode::info_from_season_episode(&ep);
+        let guids = crate::episode::guid_by_locale(&info, "M1");
+        assert_eq!(guids.get("ja-JP").map(String::as_str), Some("M1"));
+    }
+
+    #[test]
+    fn episodes_are_not_films() {
+        assert!(movie_episode(&json!({ "id": "E", "type": "episode", "title": "Ep" }), 1, "").is_none());
     }
 }

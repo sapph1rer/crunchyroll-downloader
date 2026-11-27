@@ -1,0 +1,22 @@
+# WebView2 login helper for crunchyroll-downloader.
+#
+# This is a member of the root workspace, so a single `cargo build --release` at the repo
+# root builds this helper alongside the CLI and GUI, all into the shared target/release/.
+# Ship cr-login-helper.exe next to crunchyroll-downloader-gui.exe.
+#
+# Version note: wry's builder and event-loop surface shifts between minor versions.
+# This is written for the pins below. If a bump breaks the build, the call sites to check
+# are: WebViewBuilder construction, web-context attach, and cookies_for_url.
+[package]
+name = "cr-login-helper"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "cr-login-helper"
+path = "src/main.rs"
+
+[dependencies]
+wry = "0.52"
+tao = "0.31"
+zeroize = "1"

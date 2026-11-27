@@ -308,6 +308,7 @@ mod tests {
                 series_title: "Test".into(),
                 availability_starts: String::new(),
                 versions: vec![],
+                is_movie: false,
             },
             title: "Pilot".into(),
         };

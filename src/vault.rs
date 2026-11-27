@@ -52,12 +52,33 @@ pub struct Settings {
     pub last_url: String,
     /// Episode IDs of the last download, selected again when the same link is fetched.
     pub last_picks: Vec<String>,
+    /// Optional HTTP/HTTPS/SOCKS5 proxy URL used for Crunchyroll API calls only.
+    /// CDN segment downloads bypass this proxy for maximum speed.
+    /// Example: "http://user:pass@127.0.0.1:1080" or "socks5://127.0.0.1:1080"
+    pub proxy_url: String,
+    /// Show a desktop notification when a download queue finishes.
+    pub notify_done: bool,
+}
+
+/// The default download folder: `Downloads\Crunchyroll`, falling back to the home folder,
+/// and only as a last resort the current folder.
+pub fn default_output_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .map(|d| d.join("Crunchyroll"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Whether an output folder setting means "use the default" (empty, or the old "." default
+/// that put files wherever the program happened to run from).
+pub fn output_is_unset(value: &str) -> bool {
+    matches!(value.trim(), "" | ".")
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            output_dir: ".".into(),
+            output_dir: default_output_dir().display().to_string(),
             audio_langs: "ja-JP".into(),
             subs_langs: "en-US".into(),
             cc_langs: String::new(),
@@ -66,11 +87,13 @@ impl Default for Settings {
             download_delay: "0s".into(),
             debug: false,
             ffmpeg_path: String::new(),
-            segment_workers: "10".into(),
+            segment_workers: "20".into(),
             track_workers: "2".into(),
             auto_lock_minutes: "10".into(),
             last_url: String::new(),
             last_picks: Vec::new(),
+            proxy_url: String::new(),
+            notify_done: true,
         }
     }
 }
@@ -114,10 +137,67 @@ pub struct Vault {
     pub contents: Contents,
 }
 
-/// Where the vault lives by default: the per-user config folder.
-pub fn default_path() -> Result<PathBuf> {
+/// A file with this name next to the program turns on portable mode: the vault (and a
+/// downloaded ffmpeg) then live next to the program instead of in the user's AppData, so
+/// the whole folder can be carried on a USB drive.
+pub const PORTABLE_MARKER: &str = "portable.txt";
+
+/// The folder the running program is in.
+pub fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
+/// Whether portable mode is on (the marker file sits next to the program).
+pub fn is_portable() -> bool {
+    exe_dir().is_some_and(|d| d.join(PORTABLE_MARKER).is_file())
+}
+
+/// Where the vault lives in normal (installed) mode: the per-user config folder.
+pub fn installed_path() -> Result<PathBuf> {
     let dir = dirs::config_dir().ok_or_else(|| anyhow!("no per-user config folder is available"))?;
     Ok(dir.join("crunchyroll-downloader").join("vault.bin"))
+}
+
+/// Where the vault lives: next to the program in portable mode, otherwise AppData.
+pub fn default_path() -> Result<PathBuf> {
+    if is_portable() {
+        if let Some(dir) = exe_dir() {
+            return Ok(dir.join("vault.bin"));
+        }
+    }
+    installed_path()
+}
+
+/// Turns portable mode on or off for an open vault, moving the vault file to match.
+/// Refuses to overwrite a different vault already sitting at the destination, and leaves
+/// everything as it was if the move fails. Returns the vault's new location.
+pub fn set_portable(vault: &mut Vault, on: bool) -> Result<PathBuf> {
+    let dir = exe_dir().ok_or_else(|| anyhow!("cannot find the program's folder"))?;
+    let marker = dir.join(PORTABLE_MARKER);
+    let target = if on { dir.join("vault.bin") } else { installed_path()? };
+    if target != vault.path && target.exists() {
+        bail!(
+            "a vault already exists at {}. Move or delete it first, so it is not overwritten.",
+            target.display()
+        );
+    }
+    if on {
+        // Writing the marker first also proves the folder is writable (not Program Files).
+        std::fs::write(
+            &marker,
+            "This file keeps Crunchyroll Downloader's encrypted vault next to the program (portable mode).\n\
+             Delete it, or turn portable mode off in Settings, to go back to AppData.\n",
+        )
+        .with_context(|| format!("cannot write to {} (is the folder read-only?)", dir.display()))?;
+        if let Err(e) = vault.move_to(&target) {
+            let _ = std::fs::remove_file(&marker);
+            return Err(e);
+        }
+    } else {
+        vault.move_to(&target)?;
+        let _ = std::fs::remove_file(&marker);
+    }
+    Ok(target)
 }
 
 pub fn exists(path: &Path) -> bool {
@@ -247,6 +327,24 @@ impl Vault {
         write_atomic(&self.path, &file)
     }
 
+    /// Saves the vault at a new location and removes the old file. On failure the vault
+    /// keeps its old location and the old file is untouched.
+    pub fn move_to(&mut self, new_path: &Path) -> Result<()> {
+        if new_path == self.path {
+            return self.save();
+        }
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let old = std::mem::replace(&mut self.path, new_path.to_path_buf());
+        if let Err(e) = self.save() {
+            self.path = old;
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&old);
+        Ok(())
+    }
+
     /// Re-encrypts everything under a new password, with a new salt.
     pub fn change_password(&mut self, new_password: &str) -> Result<()> {
         check_password(new_password)?;
@@ -270,6 +368,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("vault.bin")
+    }
+
+    #[test]
+    fn move_to_relocates_the_vault_and_keeps_it_readable() {
+        let from = temp("move-from");
+        let to = temp("move-to").with_file_name("moved").join("vault.bin");
+        let mut v = Vault::create(&from, "correct horse").unwrap();
+        v.contents = sample();
+        v.save().unwrap();
+        v.move_to(&to).unwrap();
+        assert!(!from.exists(), "old file removed");
+        assert_eq!(v.path(), to.as_path());
+        let back = Vault::open(&to, "correct horse").unwrap();
+        assert_eq!(&*back.contents.secrets.etp_rt, "SECRET-ETP-VALUE-123");
+    }
+
+    #[test]
+    fn old_dot_output_counts_as_unset() {
+        assert!(output_is_unset("."));
+        assert!(output_is_unset("  "));
+        assert!(!output_is_unset("D:\\Anime"));
+        assert!(default_output_dir().ends_with("Crunchyroll"));
     }
 
     fn sample() -> Contents {

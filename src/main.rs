@@ -33,6 +33,7 @@ const LONG_FLAGS: &[&str] = &[
     "debug-manifest",
     "download-delay",
     "output-dir",
+    "proxy",
 ];
 
 /// Rewrites "-name" to "--name" for known long flags, leaving values and "--" alone.
@@ -104,6 +105,11 @@ struct Cli {
     /// Minimum pause between episodes, e.g. 30s or 2m
     #[arg(long = "download-delay", default_value = "0s", help_heading = "Network")]
     download_delay: String,
+    /// Proxy URL for Crunchyroll API calls only (CDN downloads always go direct).
+    /// Supports http://, https://, and socks5://. Leave empty to disable.
+    /// Example: --proxy "socks5://127.0.0.1:1080" or "http://user:pass@host:port"
+    #[arg(long = "proxy", default_value = "", env = "CR_PROXY", help_heading = "Network")]
+    proxy: String,
     /// Folder to save into
     #[arg(long = "output-dir", default_value = ".", help_heading = "Output")]
     output_dir: PathBuf,
@@ -175,8 +181,12 @@ async fn run() -> i32 {
         return 1;
     }
 
+    if !cli.proxy.is_empty() {
+        ui::info(format!("Using proxy for API calls: {}", cli.proxy));
+    }
     ui::info("Logging in to Crunchyroll...");
-    let api = match Api::login(cli.etp_rt.clone()).await {
+    let proxy_opt = if cli.proxy.is_empty() { None } else { Some(cli.proxy.as_str()) };
+    let api = match Api::login_at(crunchyroll_downloader::api::TOKEN_URL, cli.etp_rt.clone(), proxy_opt).await {
         Ok(api) => api,
         Err(e) => {
             let err = anyhow::Error::new(e);

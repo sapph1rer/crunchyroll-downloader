@@ -1,9 +1,16 @@
 [package]
 name = "crunchyroll-downloader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Downloads anime from Crunchyroll and outputs them as MKV (Rust port of CuteTenshii/crunchyroll-downloader)"
+
+# One workspace so a single `cargo build` produces all three binaries into target/.
+# default-members includes the root package (".") and the login helper, so a bare
+# `cargo build --release` builds crunchyroll-downloader, -gui, AND cr-login-helper.
+[workspace]
+members = ["login-helper"]
+default-members = [".", "login-helper"]
 
 [dependencies]
 anyhow = "1"
@@ -35,12 +42,16 @@ dirs = "6"
 argon2 = "0.5"
 aes-gcm = "0.10"
 zeroize = { version = "1.9.1", features = ["derive"] }
-iced = { version = "0.14", features = ["tokio", "advanced"], optional = true }
+iced = { version = "0.14", features = ["tokio", "advanced", "image"], optional = true }
 rfd = { version = "0.17", optional = true }
+png = { version = "0.17", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+async-stream = { version = "0.3", optional = true }
+notify-rust = { version = "4", optional = true }
 
 [features]
 default = ["gui"]
-gui = ["dep:iced", "dep:rfd"]
+gui = ["dep:iced", "dep:rfd", "dep:png", "dep:zip", "dep:async-stream", "dep:notify-rust"]
 
 [[bin]]
 name = "crunchyroll-downloader-gui"

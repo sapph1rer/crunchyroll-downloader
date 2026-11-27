@@ -45,8 +45,9 @@ pub const NAV_GAP: f32 = 8.0;
 pub fn tab_y(tab: Tab) -> f32 {
     let index = match tab {
         Tab::Main => 0.0,
-        Tab::Settings => 1.0,
-        Tab::Logs => 2.0,
+        Tab::Browse => 1.0,
+        Tab::Settings => 2.0,
+        Tab::Logs => 3.0,
     };
     index * (NAV_H + NAV_GAP)
 }
@@ -54,8 +55,55 @@ pub fn tab_y(tab: Tab) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Main,
+    Browse,
     Settings,
     Logs,
+}
+
+/// A poster image for a Browse card.
+#[derive(Clone)]
+pub enum Poster {
+    Loading,
+    Ready(iced::widget::image::Handle),
+    Failed,
+}
+
+/// Everything the Browse tab shows: the grid, its search and order, cached posters, and
+/// the series opened from it.
+#[derive(Default)]
+pub struct BrowseState {
+    /// Search text. Empty shows the catalog in `sort` order.
+    pub query: String,
+    pub sort: engine::Sort,
+    /// Series or movies.
+    pub show: engine::Show,
+    /// A genre filter (its id), or None for every genre.
+    pub genre: Option<String>,
+    /// Genres offered by the catalog; empty until loaded (or if they can't be read).
+    pub genres: Vec<engine::Genre>,
+    pub genres_asked: bool,
+    pub items: Vec<engine::CatalogItem>,
+    /// How many catalog entries exist (for "Load more"); None for search results.
+    pub total: Option<usize>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Bumped by every new request; a result for an older number is stale and dropped.
+    pub seq: u64,
+    /// A signed-in client reused across pages and searches.
+    pub api: Option<crunchyroll_downloader::api::Api>,
+    /// Posters by image URL, loaded once per session.
+    pub posters: std::collections::HashMap<String, Poster>,
+    /// The series whose detail page is open, if any.
+    pub selected: Option<engine::CatalogItem>,
+    /// Where the grid was scrolled to, so "Back" returns to the same spot.
+    pub grid_scroll_y: f32,
+}
+
+impl BrowseState {
+    /// More catalog pages exist (search results come in one page).
+    pub fn has_more(&self) -> bool {
+        self.query.trim().is_empty() && self.total.is_some_and(|t| self.items.len() < t) && self.error.is_none()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +122,10 @@ pub enum DropdownId {
     Video,
     Audio,
     Lang(LangField),
+    /// The auto-lock (sleep) interval picker.
+    AutoLock,
+    /// The Browse genre filter.
+    Genre,
 }
 
 /// Whether ffmpeg can be used, as found by the last check.
@@ -86,6 +138,26 @@ pub enum FfmpegState {
     Ready(PathBuf),
     /// Missing or not working. The text says why.
     Broken(String),
+}
+
+/// Where a Crunchyroll sign-in currently stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginPhase {
+    /// The login window is open; waiting for the user to sign in there.
+    Waiting,
+    /// A cookie arrived (from the window or a paste) and is being checked with Crunchyroll.
+    Verifying,
+}
+
+/// Progress of an automatic ffmpeg download.
+#[derive(Clone, Debug)]
+pub enum FfmpegDlEvent {
+    /// Download fraction 0.0..=1.0, or a negative value when the total size is unknown.
+    Progress(f32),
+    /// Download finished; the archive is being unpacked.
+    Extracting,
+    /// Finished: Ok(path to the installed ffmpeg) or Err(reason).
+    Done(Result<PathBuf, String>),
 }
 
 /// One episode in the download queue, with its latest state.
@@ -133,6 +205,12 @@ pub struct App {
     /// The episode list of the last fetch, and what the user picked from it.
     pub catalog: Option<Catalog>,
     pub picked: BTreeSet<String>,
+    /// Episodes in the current list whose finished file is already in the output folder.
+    pub downloaded: BTreeSet<String>,
+    /// The Browse tab.
+    pub browse: BrowseState,
+    /// The series id the loaded episode list belongs to, when it came from a series link.
+    pub catalog_series: Option<String>,
     pub expanded: BTreeSet<i64>,
     pub fetching: bool,
     pub setup_open: bool,
@@ -155,8 +233,16 @@ pub struct App {
     pub dropdown_anim: Animation<f32>,
     /// The option the keyboard is on in the open dropdown.
     pub highlight: usize,
+    /// Search text typed into an open language dropdown. Empty when no filter is active.
+    pub dropdown_filter: String,
     /// ffmpeg status, from the last check.
     pub ffmpeg: FfmpegState,
+    /// Progress of an in-flight ffmpeg download, if one is running or just finished.
+    pub ffmpeg_dl: Option<FfmpegDlEvent>,
+    /// A sign-in in progress, if any.
+    pub login_busy: Option<LoginPhase>,
+    /// Crunchyroll refused the saved login on the last fetch; the user must sign in again.
+    pub login_expired: bool,
     /// Episodes of the current or last download, with their states.
     pub queue: Vec<QueueItem>,
     /// Folder the last download writes to, for the Open folder button.
@@ -218,10 +304,37 @@ pub enum Message {
     RetryEpisode(String),
     RetryFailed,
     OpenOutput,
+    /// Browse tab: search text typed (debounced), the debounce firing, Enter, clear.
+    BrowseQueryInput(String),
+    BrowseSearchFire(u64),
+    BrowseSubmit,
+    BrowseClearSearch,
+    BrowseSort(engine::Sort),
+    BrowseShow(engine::Show),
+    BrowseMore,
+    BrowseRetry,
+    /// A Browse page arrived: (request number, client to reuse, result).
+    BrowseLoaded(u64, Option<crunchyroll_downloader::api::Api>, Result<engine::BrowsePage, String>),
+    PosterLoaded(String, Result<Vec<u8>, String>),
+    /// Open a series' detail page (and load its seasons and episodes).
+    OpenSeries(engine::CatalogItem),
+    BrowseBack,
+    /// The page was scrolled (remembers the Browse grid spot, loads more near the bottom).
+    PageScrolled(iced::widget::scrollable::Viewport),
+    /// Download one episode right away.
+    DownloadOne(String),
+    /// Download every episode of a season that is not already on disk.
+    DownloadSeason(i64),
+    /// Leftover temp files removed at startup: (count, bytes).
+    TempCleaned(usize, u64),
+    SetNotify(bool),
+    SetPortable(bool),
     Tick,
     Frame(Instant),
     ToggleDropdown(DropdownId),
     CloseDropdown,
+    /// Search text typed into an open language dropdown.
+    DropdownFilter(String),
     Choose(DropdownId, String),
     KeyPressed(keyboard::Key),
     RemoveLang(LangField, String),
@@ -231,18 +344,30 @@ pub enum Message {
     SetOutputDir(String),
     SetSegmentWorkers(String),
     SetTrackWorkers(String),
-    SetAutoLock(String),
+    SetProxyUrl(String),
     BrowseOutput,
     OutputPicked(Option<PathBuf>),
     PickFfmpeg,
     FfmpegPicked(Option<PathBuf>),
     UseAutoFfmpeg,
     FfmpegChecked(Result<PathBuf, String>),
+    /// Start downloading and installing ffmpeg automatically.
+    DownloadFfmpeg,
+    /// A progress event from the running ffmpeg download.
+    FfmpegDl(FfmpegDlEvent),
     OpenSetup,
     GoSetup,
     CloseSetup,
     EtpDraftInput(String),
     SaveEtp,
+    /// Open the WebView2 login helper and capture etp_rt automatically.
+    BrowserLogin,
+    /// The login helper finished: Ok(etp_rt) or Err(reason). The cookie is zeroed on drop.
+    BrowserLoginDone(Result<Zeroizing<String>, String>),
+    /// Crunchyroll answered the check of a new cookie. Ok: it works. Err((rejected, why)).
+    LoginVerified(Zeroizing<String>, Result<(), (bool, String)>),
+    /// Forget the saved login.
+    SignOut,
     PickClientId,
     ClientIdPicked(Option<Vec<u8>>),
     PickPem,
@@ -288,6 +413,9 @@ impl App {
             setup_anim: Animation::new(0.0).duration(Duration::from_millis(340)).easing(Easing::EaseOutExpo),
             catalog: None,
             picked: BTreeSet::new(),
+            downloaded: BTreeSet::new(),
+            browse: BrowseState::default(),
+            catalog_series: None,
             expanded: BTreeSet::new(),
             fetching: false,
             setup_open: false,
@@ -307,12 +435,21 @@ impl App {
                 .duration(Duration::from_millis(DROPDOWN_MS))
                 .easing(Easing::EaseOutCubic),
             highlight: 0,
+            dropdown_filter: String::new(),
             ffmpeg: FfmpegState::Unknown,
+            ffmpeg_dl: None,
+            login_busy: None,
+            login_expired: false,
             queue: Vec::new(),
             last_output: None,
             last_activity: Instant::now(),
         };
-        (app, focus_password())
+        // Clear out temp files a crash or forced close left behind, in the background.
+        let clean = Task::perform(
+            async { tokio::task::spawn_blocking(clean_stale_temp).await.unwrap_or((0, 0)) },
+            |(files, bytes)| Message::TempCleaned(files, bytes),
+        );
+        (app, Task::batch([focus_password(), clean]))
     }
 
     /// Current top of the navigation pill, at time `now`.
@@ -438,9 +575,38 @@ impl App {
         self.dropdown_anim.interpolate_with(|v| v, self.now)
     }
 
+    /// Checks a new etp_rt with Crunchyroll before it is stored. The result arrives as
+    /// `LoginVerified`, carrying the cookie back so only a working one is saved.
+    fn verify_login(&mut self, etp: Zeroizing<String>) -> Task<Message> {
+        self.login_busy = Some(LoginPhase::Verifying);
+        ui::info("Checking the login with Crunchyroll");
+        let proxy = self.vault.as_ref().map(|v| v.contents.settings.proxy_url.clone()).unwrap_or_default();
+        let check = etp.clone();
+        Task::perform(
+            async move {
+                let result = engine::verify_login(check, proxy).await;
+                (etp, result)
+            },
+            |(etp, result)| Message::LoginVerified(etp, result),
+        )
+    }
+
+    /// Saves a login into the encrypted vault and clears any leftover draft and expiry flag.
+    fn store_login(&mut self, etp: &str) -> Result<(), String> {
+        let Some(v) = self.vault.as_mut() else { return Err("The vault is locked.".into()) };
+        v.contents.secrets.etp_rt = etp.trim().to_string();
+        v.save().map_err(|e| format!("{e:#}"))?;
+        self.etp_draft.zeroize();
+        self.etp_draft.clear();
+        self.login_expired = false;
+        self.refresh_secrets();
+        Ok(())
+    }
+
     /// Starts closing the open dropdown. Its list stays drawn until the animation ends.
     fn close_dropdown(&mut self) {
         self.dropdown = None;
+        self.dropdown_filter.clear();
         self.dropdown_anim.go_mut(0.0, Instant::now());
     }
 
@@ -502,18 +668,106 @@ impl App {
         self.tab = Tab::Main;
         self.notice = None;
         self.catalog = None;
+        self.catalog_series = None;
         self.picked.clear();
         self.expanded.clear();
         self.fetching = false;
         self.dropdown = None;
         self.dropdown_last = None;
         self.queue.clear();
+        // The cached Browse session holds a live access token: drop it when locking.
+        self.browse = BrowseState::default();
         self.last_output = None;
         self.ffmpeg = FfmpegState::Unknown;
         self.highlight = 0;
     }
 
-    fn open_vault(&mut self, vault: Vault) {
+    /// Loads the Browse grid: the next page of the catalog (`append`), or a fresh first page or
+    /// search for the current text. Needs a saved login; without one the tab shows a prompt.
+    fn browse_load(&mut self, append: bool) -> Task<Message> {
+        let Some(v) = self.vault.as_ref() else { return Task::none() };
+        let etp = v.contents.secrets.etp_rt.clone();
+        if etp.is_empty() {
+            return Task::none();
+        }
+        let st = &v.contents.settings;
+        let locale = preferred_request_locale(&parse_langs(&st.subs_langs), "en-US");
+        let text = self.browse.query.trim().to_string();
+        let query = if text.is_empty() {
+            let start = if append { self.browse.items.len() } else { 0 };
+            engine::BrowseQuery::Page { sort: self.browse.sort, show: self.browse.show, genre: self.browse.genre.clone(), start }
+        } else {
+            engine::BrowseQuery::Search(text)
+        };
+        if !append {
+            self.browse.seq += 1;
+        }
+        let seq = self.browse.seq;
+        self.browse.loading = true;
+        self.browse.error = None;
+        let want_genres = !self.browse.genres_asked;
+        self.browse.genres_asked = true;
+        let input = engine::BrowseInput {
+            api: self.browse.api.clone(),
+            etp: Zeroizing::new(etp),
+            proxy_url: st.proxy_url.clone(),
+            locale,
+            query,
+            want_genres,
+        };
+        Task::perform(engine::browse(input), move |(api, result)| Message::BrowseLoaded(seq, api, result))
+    }
+
+    /// Starts loading every poster on screen that isn't cached or loading yet.
+    fn load_posters(&mut self) -> Task<Message> {
+        let mut wanted: Vec<String> = self.browse.items.iter().filter_map(|i| i.poster.clone()).collect();
+        if let Some(sel) = &self.browse.selected {
+            wanted.extend(sel.poster_large.clone().or_else(|| sel.poster.clone()));
+        }
+        let mut tasks = Vec::new();
+        for url in wanted {
+            if self.browse.posters.contains_key(&url) {
+                continue;
+            }
+            self.browse.posters.insert(url.clone(), Poster::Loading);
+            let key = url.clone();
+            tasks.push(Task::perform(engine::poster(url), move |r| Message::PosterLoaded(key.clone(), r)));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Recomputes which episodes of the current list already have their finished file in the
+    /// output folder, using the same naming rule the downloader uses.
+    fn refresh_downloaded(&mut self) {
+        let mut found = BTreeSet::new();
+        if let (Some(catalog), Some(v)) = (&self.catalog, &self.vault) {
+            let st = &v.contents.settings;
+            let dir = resolve_output(st);
+            for ep in catalog.seasons.iter().flat_map(|g| g.episodes.iter()) {
+                let file = crunchyroll_downloader::episode::output_path(
+                    &dir,
+                    &ep.series_title,
+                    ep.season_number,
+                    ep.episode_number,
+                    &ep.title,
+                    &st.video_quality,
+                    ep.is_movie,
+                );
+                if file.is_file() {
+                    found.insert(ep.id.clone());
+                }
+            }
+        }
+        self.downloaded = found;
+    }
+
+    fn open_vault(&mut self, mut vault: Vault) {
+        // Older vaults saved "." (wherever the program ran from) as the output folder, which
+        // scattered videos into the build folder. Move them to Downloads\Crunchyroll.
+        if vault::output_is_unset(&vault.contents.settings.output_dir) {
+            vault.contents.settings.output_dir = vault::default_output_dir().display().to_string();
+            let _ = vault.save();
+        }
         // The last link is restored, so the next fetch is one click away.
         self.url = vault.contents.settings.last_url.clone();
         self.vault = Some(vault);
@@ -577,10 +831,15 @@ impl App {
                 self.close_dropdown();
                 self.drain_logs();
                 // Every page starts at the top, so a stale scroll position never hides the page.
-                return iced::widget::operation::scroll_to(
+                let top = iced::widget::operation::scroll_to(
                     page_scroll_id(),
                     iced::widget::scrollable::AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
                 );
+                // The first visit to Browse fills the grid.
+                if t == Tab::Browse && self.browse.items.is_empty() && !self.browse.loading {
+                    return Task::batch([top, self.browse_load(false)]);
+                }
+                return top;
             }
             Message::Frame(at) => {
                 let dt = self
@@ -710,21 +969,39 @@ impl App {
                         if seasons == 1 {
                             self.expanded.insert(catalog.seasons[0].number);
                         }
-                        // Episodes picked in the last download are picked again, when they are in this list.
+                        // Episodes picked in the last download are picked again, when they are in
+                        // this list — except ones that are already on disk.
                         let saved: Vec<String> = self
                             .vault
                             .as_ref()
                             .map(|v| v.contents.settings.last_picks.clone())
                             .unwrap_or_default();
+                        self.catalog = Some(catalog);
+                        self.catalog_series = parse_url(&self.url)
+                            .filter(|(kind, _)| matches!(*kind, "series" | "movie_listing"))
+                            .map(|(_, id)| id.to_string());
+                        self.refresh_downloaded();
+                        let catalog = self.catalog.as_ref().expect("just set");
                         self.picked = catalog
                             .seasons
                             .iter()
                             .flat_map(|g| g.episodes.iter())
-                            .filter(|e| saved.contains(&e.id))
+                            .filter(|e| saved.contains(&e.id) && !self.downloaded.contains(&e.id))
                             .map(|e| e.id.clone())
                             .collect();
-                        self.notice = Some((Kind::Ok, format!("{} · {seasons} season(s), {episodes} episode(s). Pick what to download.", catalog.title)));
-                        self.catalog = Some(catalog);
+                        let have = self.downloaded.len();
+                        let note = if have > 0 { format!(" {have} already downloaded.") } else { String::new() };
+                        self.notice = Some((
+                            Kind::Ok,
+                            format!("{} · {seasons} season(s), {episodes} episode(s).{note} Pick what to download.", catalog.title),
+                        ));
+                        // A successful fetch proves the login works.
+                        self.login_expired = false;
+                    }
+                    Some(Err(e)) if engine::is_login_expired(&e) => {
+                        // Show a clear "log in again" prompt instead of a raw API error.
+                        self.login_expired = true;
+                        self.notice = Some((Kind::Warn, "Your Crunchyroll login has expired. Press Log in to sign in again.".into()));
                     }
                     Some(Err(e)) => self.notice = Some((Kind::Fail, e)),
                     None => {}
@@ -764,7 +1041,8 @@ impl App {
                     .map(|c| c.seasons.iter().flat_map(|g| g.episodes.iter().map(|e| e.id.clone())).collect())
                     .unwrap_or_default();
                 if on {
-                    self.picked.extend(ids);
+                    // Already-downloaded episodes stay unticked; they can still be ticked by hand.
+                    self.picked.extend(ids.into_iter().filter(|id| !self.downloaded.contains(id)));
                 } else {
                     self.picked.clear();
                 }
@@ -794,15 +1072,29 @@ impl App {
                 if failed == 0 {
                     self.progress_target = 1.0;
                     self.current = "Finished".into();
-                    self.notice = Some((Kind::Ok, text));
+                    self.notice = Some((Kind::Ok, text.clone()));
                 } else {
                     self.current = "Finished with errors".into();
-                    self.notice = Some((Kind::Warn, text));
+                    self.notice = Some((Kind::Warn, text.clone()));
                 }
+                // New files are on disk now: mark them in the episode list.
+                self.refresh_downloaded();
                 // Flash the taskbar, so a finished download is noticed when the window is in the background.
-                return window::latest().and_then(|id| {
+                let flash = window::latest().and_then(|id| {
                     window::request_user_attention(id, Some(window::UserAttention::Informational))
                 });
+                let wants_toast = self.vault.as_ref().is_some_and(|v| v.contents.settings.notify_done);
+                if !wants_toast || self.queue.is_empty() {
+                    return flash;
+                }
+                let title = if failed == 0 { "Downloads finished" } else { "Downloads finished with errors" };
+                let toast = Task::perform(
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || show_toast(title, &text)).await;
+                    },
+                    |()| Message::Tick,
+                );
+                return Task::batch([flash, toast]);
             }
             Message::CancelEpisode(id) => {
                 progress::cancel_episode(&id);
@@ -826,10 +1118,173 @@ impl App {
                 return self.start_run(episodes, false);
             }
             Message::OpenOutput => {
-                if let Some(path) = self.last_output.clone() {
+                // The last run's folder, or the configured one when nothing ran yet.
+                let path = self.last_output.clone().or_else(|| self.vault.as_ref().map(|v| resolve_output(&v.contents.settings)));
+                if let Some(path) = path {
+                    let _ = std::fs::create_dir_all(&path);
                     if let Err(e) = open_folder(&path) {
                         self.notice = Some((Kind::Fail, format!("Could not open {}: {e}", path.display())));
                     }
+                }
+            }
+            Message::BrowseQueryInput(text) => {
+                self.browse.query = text;
+                // Wait for a short pause in typing before searching.
+                self.browse.seq += 1;
+                let seq = self.browse.seq;
+                return Task::perform(tokio::time::sleep(Duration::from_millis(400)), move |()| Message::BrowseSearchFire(seq));
+            }
+            Message::BrowseSearchFire(seq) => {
+                if seq == self.browse.seq {
+                    return self.browse_load(false);
+                }
+            }
+            Message::BrowseSubmit | Message::BrowseRetry => return self.browse_load(false),
+            Message::BrowseClearSearch => {
+                self.browse.query.clear();
+                return self.browse_load(false);
+            }
+            Message::BrowseSort(sort) => {
+                self.browse.sort = sort;
+                self.browse.query.clear();
+                return self.browse_load(false);
+            }
+            Message::BrowseShow(show) => {
+                self.browse.show = show;
+                self.browse.query.clear();
+                return self.browse_load(false);
+            }
+            Message::BrowseMore => {
+                if !self.browse.loading {
+                    return self.browse_load(true);
+                }
+            }
+            Message::BrowseLoaded(seq, api, result) => {
+                if seq != self.browse.seq {
+                    return Task::none(); // an older request; a newer one is on its way
+                }
+                self.browse.loading = false;
+                match result {
+                    Ok(page) => {
+                        self.browse.api = api;
+                        self.browse.error = None;
+                        if page.append {
+                            for item in page.items {
+                                if !self.browse.items.iter().any(|i| i.id == item.id) {
+                                    self.browse.items.push(item);
+                                }
+                            }
+                        } else {
+                            self.browse.items = page.items;
+                        }
+                        self.browse.total = page.total;
+                        if let Some(genres) = page.genres {
+                            self.browse.genres = genres;
+                        }
+                        return self.load_posters();
+                    }
+                    Err(e) => {
+                        // Sign in afresh next time; the cached session may be what failed.
+                        self.browse.api = None;
+                        // Try the genre list again with the next request.
+                        if self.browse.genres.is_empty() {
+                            self.browse.genres_asked = false;
+                        }
+                        if engine::is_login_expired(&e) {
+                            self.login_expired = true;
+                            self.browse.error = Some("Your Crunchyroll login has expired. Log in again to browse.".into());
+                        } else {
+                            self.browse.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Message::PosterLoaded(url, result) => {
+                let poster = match result {
+                    Ok(bytes) => Poster::Ready(iced::widget::image::Handle::from_bytes(bytes)),
+                    Err(_) => Poster::Failed,
+                };
+                self.browse.posters.insert(url, poster);
+            }
+            Message::OpenSeries(item) => {
+                self.url = item.link();
+                let already = self.catalog.is_some() && self.catalog_series.as_deref() == Some(item.id.as_str());
+                self.browse.selected = Some(item);
+                let posters = self.load_posters();
+                let top = iced::widget::operation::scroll_to(
+                    page_scroll_id(),
+                    iced::widget::scrollable::AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
+                );
+                if already || self.running {
+                    // Already loaded, or a download is running (the list can't change mid-run).
+                    return Task::batch([posters, top]);
+                }
+                return Task::batch([self.fetch(), posters, top]);
+            }
+            Message::BrowseBack => {
+                self.browse.selected = None;
+                return iced::widget::operation::scroll_to(
+                    page_scroll_id(),
+                    iced::widget::scrollable::AbsoluteOffset { x: Some(0.0), y: Some(self.browse.grid_scroll_y) },
+                );
+            }
+            Message::PageScrolled(viewport) => {
+                // Only the grid counts; the detail page and other tabs scroll on their own.
+                if self.tab == Tab::Browse && self.browse.selected.is_none() {
+                    let y = viewport.absolute_offset().y;
+                    self.browse.grid_scroll_y = y;
+                    let left = viewport.content_bounds().height - viewport.bounds().height - y;
+                    if left < 600.0 && self.browse.has_more() && !self.browse.loading {
+                        return self.browse_load(true);
+                    }
+                }
+            }
+            Message::DownloadOne(id) => {
+                let episode = self
+                    .catalog
+                    .as_ref()
+                    .and_then(|c| c.seasons.iter().flat_map(|g| g.episodes.iter()).find(|e| e.id == id).cloned());
+                if let Some(ep) = episode {
+                    return self.start_run(vec![ep], true);
+                }
+            }
+            Message::DownloadSeason(number) => {
+                let season: Vec<SeasonEpisode> = self
+                    .catalog
+                    .as_ref()
+                    .and_then(|c| c.seasons.iter().find(|g| g.number == number))
+                    .map(|g| g.episodes.clone())
+                    .unwrap_or_default();
+                // Skip what is already on disk; if that is everything, let the downloader say so.
+                let missing: Vec<SeasonEpisode> = season.iter().filter(|e| !self.downloaded.contains(&e.id)).cloned().collect();
+                let episodes = if missing.is_empty() { season } else { missing };
+                if !episodes.is_empty() {
+                    return self.start_run(episodes, true);
+                }
+            }
+            Message::TempCleaned(files, bytes) => {
+                if files > 0 {
+                    ui::info(format!(
+                        "Cleaned up {files} leftover temp file(s) from an interrupted run ({:.1} MB freed)",
+                        bytes as f64 / 1_048_576.0
+                    ));
+                }
+            }
+            Message::SetNotify(on) => self.edit_settings(|st| st.notify_done = on),
+            Message::SetPortable(on) => {
+                let Some(v) = self.vault.as_mut() else { return Task::none() };
+                match vault::set_portable(v, on) {
+                    Ok(path) => {
+                        self.vault_path = path.clone();
+                        let text = if on {
+                            format!("Portable mode on. The vault now lives next to the program: {}", path.display())
+                        } else {
+                            format!("Portable mode off. The vault moved back to {}", path.display())
+                        };
+                        ui::ok(&text);
+                        self.notice = Some((Kind::Ok, text));
+                    }
+                    Err(e) => self.notice = Some((Kind::Fail, format!("Could not switch portable mode: {e:#}"))),
                 }
             }
             Message::Tick => {
@@ -844,7 +1299,8 @@ impl App {
                     self.close_dropdown();
                 } else {
                     // Opening starts from closed, so switching between lists animates too.
-                    // The keyboard starts on the current value.
+                    // The keyboard starts on the current value. A fresh open clears any filter.
+                    self.dropdown_filter.clear();
                     self.highlight = views::highlight_for_open(self, id);
                     self.dropdown = Some(id);
                     self.dropdown_last = Some(id);
@@ -859,16 +1315,32 @@ impl App {
                     self.close_dropdown();
                 }
             }
+            Message::DropdownFilter(text) => {
+                self.dropdown_filter = text;
+                // The filtered list changes length, so start the keyboard at the top.
+                self.highlight = 0;
+            }
             Message::KeyPressed(key) => return self.dropdown_key(key),
             Message::Choose(id, value) => {
                 match id {
-                    DropdownId::Video => self.edit_settings(|st| st.video_quality = value),
+                    DropdownId::Video => {
+                        self.edit_settings(|st| st.video_quality = value);
+                        // The quality is part of the file name, so "already downloaded" changes.
+                        self.refresh_downloaded();
+                    }
                     DropdownId::Audio => self.edit_settings(|st| st.audio_quality = value),
                     DropdownId::Lang(field) => self.edit_settings(|st| {
                         let slot = lang_slot(st, field);
                         let next = add_lang(slot.as_str(), &value);
                         *slot = next;
                     }),
+                    DropdownId::AutoLock => self.edit_settings(|st| st.auto_lock_minutes = value),
+                    DropdownId::Genre => {
+                        self.browse.genre = (!value.is_empty()).then_some(value);
+                        self.browse.query.clear();
+                        self.close_dropdown();
+                        return self.browse_load(false);
+                    }
                 }
                 // Quality lists close after a pick. Language lists stay open for several picks.
                 if !matches!(id, DropdownId::Lang(_)) {
@@ -885,10 +1357,13 @@ impl App {
             Message::ToggleSecret => self.show_secret = !self.show_secret,
             Message::SetDelay(s) => self.edit_settings(|st| st.download_delay = s),
             Message::SetDebug(b) => self.edit_settings(|st| st.debug = b),
-            Message::SetOutputDir(s) => self.edit_settings(|st| st.output_dir = s),
+            Message::SetOutputDir(s) => {
+                self.edit_settings(|st| st.output_dir = s);
+                self.refresh_downloaded();
+            }
             Message::SetSegmentWorkers(s) => self.edit_settings(|st| st.segment_workers = s),
             Message::SetTrackWorkers(s) => self.edit_settings(|st| st.track_workers = s),
-            Message::SetAutoLock(s) => self.edit_settings(|st| st.auto_lock_minutes = s),
+            Message::SetProxyUrl(s) => self.edit_settings(|st| st.proxy_url = s),
             Message::BrowseOutput => {
                 return Task::perform(
                     async {
@@ -904,6 +1379,7 @@ impl App {
             Message::OutputPicked(Some(path)) => {
                 let text = path.display().to_string();
                 self.edit_settings(|st| st.output_dir = text);
+                self.refresh_downloaded();
             }
             Message::OutputPicked(None) => {}
             Message::PickFfmpeg => {
@@ -937,6 +1413,30 @@ impl App {
                     };
                 }
             }
+            Message::DownloadFfmpeg => {
+                if matches!(self.ffmpeg_dl, Some(FfmpegDlEvent::Progress(_)) | Some(FfmpegDlEvent::Extracting)) {
+                    return Task::none(); // already running
+                }
+                self.ffmpeg_dl = Some(FfmpegDlEvent::Progress(0.0));
+                ui::info("Downloading ffmpeg...");
+                return Task::run(download_ffmpeg_stream(), Message::FfmpegDl);
+            }
+            Message::FfmpegDl(event) => match event {
+                FfmpegDlEvent::Done(Ok(path)) => {
+                    self.ffmpeg_dl = None;
+                    ui::ok(format!("ffmpeg installed at {}", path.display()));
+                    // Portable: leave the path empty so the search finds it next to the program
+                    // on any drive letter. Otherwise remember the exact path.
+                    let text = if vault::is_portable() { String::new() } else { path.display().to_string() };
+                    self.edit_settings(|st| st.ffmpeg_path = text);
+                    return self.check_ffmpeg();
+                }
+                FfmpegDlEvent::Done(Err(e)) => {
+                    ui::warn(&e);
+                    self.ffmpeg_dl = Some(FfmpegDlEvent::Done(Err(e)));
+                }
+                other => self.ffmpeg_dl = Some(other),
+            },
             Message::OpenSetup => {
                 self.setup_open = true;
                 self.setup_anim.go_mut(1.0, Instant::now());
@@ -954,17 +1454,76 @@ impl App {
             }
             Message::EtpDraftInput(s) => self.etp_draft = s,
             Message::SaveEtp => {
-                let value = std::mem::take(&mut self.etp_draft);
-                let Some(v) = self.vault.as_mut() else { return Task::none() };
-                if value.trim().is_empty() {
+                // A pasted cookie goes through the same check as one from the login window.
+                let value = Zeroizing::new(self.etp_draft.trim().to_string());
+                if value.is_empty() {
                     self.notice = Some((Kind::Warn, "Paste the etp_rt value first.".into()));
                     return Task::none();
                 }
-                v.contents.secrets.etp_rt = value.trim().to_string();
+                if self.login_busy.is_some() {
+                    return Task::none();
+                }
+                return self.verify_login(value);
+            }
+            Message::BrowserLogin => {
+                if self.login_busy.is_some() {
+                    return Task::none(); // a login window is already open
+                }
+                self.login_busy = Some(LoginPhase::Waiting);
+                self.notice = Some((Kind::Info, "Sign in in the window that just opened. It closes by itself when you're done.".into()));
+                ui::info("Opening the Crunchyroll login window");
+                return Task::perform(run_login_helper(), Message::BrowserLoginDone);
+            }
+            Message::BrowserLoginDone(result) => match result {
+                Ok(etp) => return self.verify_login(etp),
+                Err(e) => {
+                    self.login_busy = None;
+                    self.notice = Some((Kind::Warn, e.clone()));
+                    ui::warn(&e);
+                }
+            },
+            Message::LoginVerified(etp, result) => {
+                self.login_busy = None;
+                match result {
+                    Ok(()) => match self.store_login(&etp) {
+                        Ok(()) => {
+                            self.notice = Some((Kind::Ok, "Signed in to Crunchyroll. Your login is saved encrypted.".into()));
+                            ui::ok("Signed in: the login works and is saved in the vault");
+                        }
+                        Err(e) => self.notice = Some((Kind::Fail, e)),
+                    },
+                    Err((true, why)) => {
+                        // Crunchyroll refused it: never store a cookie that cannot work.
+                        self.notice = Some((
+                            Kind::Fail,
+                            "Crunchyroll did not accept that login. Please sign in again.".into(),
+                        ));
+                        ui::warn(&format!("Login rejected, not saved: {why}"));
+                    }
+                    Err((false, why)) => {
+                        // Could not reach Crunchyroll to check. The cookie itself may be fine.
+                        match self.store_login(&etp) {
+                            Ok(()) => {
+                                self.notice = Some((
+                                    Kind::Warn,
+                                    format!("Login saved, but it could not be checked right now ({why}). It will be checked on your next fetch."),
+                                ));
+                                ui::warn(&format!("Login saved without a check: {why}"));
+                            }
+                            Err(e) => self.notice = Some((Kind::Fail, e)),
+                        }
+                    }
+                }
+            }
+            Message::SignOut => {
+                let Some(v) = self.vault.as_mut() else { return Task::none() };
+                v.contents.secrets.etp_rt.zeroize();
+                v.contents.secrets.etp_rt.clear();
                 match v.save() {
                     Ok(()) => {
-                        self.notice = Some((Kind::Ok, "etp_rt saved (encrypted).".into()));
-                        ui::ok("etp_rt saved to the encrypted vault");
+                        self.login_expired = false;
+                        self.notice = Some((Kind::Info, "Signed out. The saved login was removed from the vault.".into()));
+                        ui::info("Signed out: login removed from the vault");
                     }
                     Err(e) => self.notice = Some((Kind::Fail, format!("{e:#}"))),
                 }
@@ -1120,7 +1679,7 @@ impl App {
             return Task::none();
         };
         if parse_url(&url).is_none() {
-            self.notice = Some((Kind::Warn, "The link must contain /watch/ or /series/.".into()));
+            self.notice = Some((Kind::Warn, "The link must contain /watch/, /series/ or /movie_listing/.".into()));
             return Task::none();
         }
         let st = &v.contents.settings;
@@ -1129,6 +1688,7 @@ impl App {
             url: url.clone(),
             audio: preferred_request_locale(&parse_langs(&st.audio_langs), "ja-JP"),
             subs: preferred_request_locale(&parse_langs(&st.subs_langs), "en-US"),
+            proxy_url: st.proxy_url.clone(),
         };
         // Remember the link, so the next unlock starts from it.
         self.edit_settings(|st| st.last_url = url);
@@ -1228,7 +1788,7 @@ impl App {
                 pem: Zeroizing::new(secrets.private_key_pem.clone().unwrap_or_default()),
             },
         };
-        let output = PathBuf::from(&st.output_dir);
+        let output = resolve_output(st);
         let opts = Options {
             audio_langs,
             subs_langs: parse_langs(&st.subs_langs),
@@ -1247,6 +1807,7 @@ impl App {
             delay,
             ffmpeg_path: st.ffmpeg_path.clone(),
             episodes: episodes.clone(),
+            proxy_url: st.proxy_url.clone(),
         };
         let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
 
@@ -1367,7 +1928,270 @@ fn theme_of(_: &App) -> iced::Theme {
     theme::theme()
 }
 
+/// Runs the external WebView2 login helper on a blocking thread and returns the captured
+/// etp_rt, or a human-readable reason it didn't. The helper is a separate process so its
+/// browser event loop never tangles with iced's.
+async fn run_login_helper() -> Result<Zeroizing<String>, String> {
+    tokio::task::spawn_blocking(run_login_helper_blocking)
+        .await
+        .map_err(|e| format!("login task failed: {e}"))?
+}
+
+#[cfg(windows)]
+fn run_login_helper_blocking() -> Result<Zeroizing<String>, String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    // CREATE_NO_WINDOW: belt-and-suspenders so no console flashes even if the helper is ever
+    // built as a console binary.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = locate_helper();
+    let out = Command::new(&exe)
+        .arg("--timeout-secs")
+        .arg("300")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("could not start the login helper ({}): {e}", exe.display()))?;
+    match out.status.code() {
+        Some(0) => {
+            let mut stdout = out.stdout;
+            let found = String::from_utf8_lossy(&stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("ETP_RT="))
+                .map(|s| Zeroizing::new(s.trim().to_string()))
+                .filter(|s| !s.is_empty());
+            // The raw pipe buffer held the cookie too; wipe it.
+            stdout.zeroize();
+            found.ok_or_else(|| "Login finished but no login cookie was found. Please try again.".to_string())
+        }
+        Some(2) => Err("Login window was closed before sign-in.".to_string()),
+        Some(3) => Err("Login timed out. Try again.".to_string()),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!("Login helper failed: {}", err.trim()))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_login_helper_blocking() -> Result<Zeroizing<String>, String> {
+    Err("Browser login uses WebView2 and is available on Windows only. Paste etp_rt manually instead.".to_string())
+}
+
+/// The login helper sits next to the app's own executable when they ship together; fall
+/// back to the plain name so PATH can resolve it in a dev build.
+#[cfg(windows)]
+fn locate_helper() -> PathBuf {
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let candidate = dir.join("cr-login-helper.exe");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("cr-login-helper.exe")
+}
+
+/// Where a downloaded ffmpeg is installed: the app's per-user data folder, which is always
+/// writable (unlike next to the .exe, which may be in Program Files).
+const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+/// The folder downloads go to: the setting, or Downloads\Crunchyroll when it is unset.
+pub(crate) fn resolve_output(st: &Settings) -> PathBuf {
+    if vault::output_is_unset(&st.output_dir) {
+        vault::default_output_dir()
+    } else {
+        PathBuf::from(st.output_dir.trim())
+    }
+}
+
+/// Temp files older than this are leftovers: a live download rewrites its files constantly.
+const STALE_TEMP: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Removes this program's leftovers from the temp folder — decrypted tracks and subtitles
+/// (`crdl-*`), half-downloaded ffmpeg archives (`ffmpeg-dl-*`) and login-window profiles
+/// (`cr-login-*`) — that a crash or forced close left behind. Only touches our own name
+/// prefixes, and only items untouched for hours, so a download running in another window
+/// is never disturbed. Returns (items removed, bytes freed).
+fn clean_stale_temp() -> (usize, u64) {
+    fn size_of(path: &Path) -> u64 {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() => std::fs::read_dir(path)
+                .map(|rd| rd.flatten().map(|e| size_of(&e.path())).sum())
+                .unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return (0, 0) };
+    let now = std::time::SystemTime::now();
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = ["crdl-", "ffmpeg-dl-", "cr-login-"].iter().any(|p| name.starts_with(p));
+        if !ours {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age >= STALE_TEMP);
+        if !old {
+            continue;
+        }
+        let path = entry.path();
+        let size = size_of(&path);
+        let removed = if meta.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        if removed.is_ok() {
+            count += 1;
+            bytes += size;
+        }
+    }
+    (count, bytes)
+}
+
+/// Shows a desktop notification. Failures (no notification service) are ignored: the
+/// taskbar flash still happens.
+fn show_toast(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new()
+        .appname("Crunchyroll Downloader")
+        .summary(title)
+        .body(body)
+        .show();
+}
+
+fn ffmpeg_install_path() -> Result<PathBuf, String> {
+    // Portable mode keeps ffmpeg next to the program, where the automatic search finds it
+    // even when the drive letter changes.
+    if vault::is_portable() {
+        if let Some(dir) = vault::exe_dir() {
+            return Ok(dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }));
+        }
+    }
+    let base = dirs::data_local_dir().ok_or_else(|| "no data directory on this system".to_string())?;
+    let dir = base.join("crunchyroll-downloader").join("ffmpeg");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    Ok(dir.join(name))
+}
+
+/// Pulls ffmpeg(.exe) out of a downloaded build zip (gyan/BtbN nest it under a versioned
+/// `.../bin/ffmpeg.exe`) and writes it to `out`.
+fn extract_ffmpeg(zip_path: &std::path::Path, out: &std::path::Path) -> Result<PathBuf, String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("opening the archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("reading the archive: {e}"))?;
+    let want = if cfg!(windows) { "bin/ffmpeg.exe" } else { "bin/ffmpeg" };
+    let index = (0..archive.len())
+        .find(|&i| {
+            archive
+                .by_index(i)
+                .map(|f| f.name().replace('\\', "/").ends_with(want))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| "the archive did not contain ffmpeg".to_string())?;
+    let mut entry = archive.by_index(index).map_err(|e| format!("opening ffmpeg in the archive: {e}"))?;
+    let mut dest = std::fs::File::create(out).map_err(|e| format!("creating {}: {e}", out.display()))?;
+    std::io::copy(&mut entry, &mut dest).map_err(|e| format!("extracting ffmpeg: {e}"))?;
+    drop(dest);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(out.to_path_buf())
+}
+
+/// Streams an ffmpeg download: Progress while fetching, Extracting while unpacking, then
+/// Done(path|error). Progress is throttled to whole-percent steps so it doesn't flood the UI.
+fn download_ffmpeg_stream() -> impl futures::Stream<Item = FfmpegDlEvent> {
+    async_stream::stream! {
+        let install = match ffmpeg_install_path() {
+            Ok(p) => p,
+            Err(e) => { yield FfmpegDlEvent::Done(Err(e)); return; }
+        };
+        let tmp_zip = std::env::temp_dir().join(format!("ffmpeg-dl-{}.zip", std::process::id()));
+
+        let client = wreq::Client::new();
+        let resp = match client.get(FFMPEG_URL).send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => r,
+            Err(e) => { yield FfmpegDlEvent::Done(Err(format!("download failed: {e}"))); return; }
+        };
+        let total = resp.content_length();
+
+        let file = match tokio::fs::File::create(&tmp_zip).await {
+            Ok(f) => f,
+            Err(e) => { yield FfmpegDlEvent::Done(Err(format!("cannot write a temp file: {e}"))); return; }
+        };
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut body = resp.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let mut last_pct: i32 = -1;
+        let mut last_bytes: u64 = 0;
+        yield FfmpegDlEvent::Progress(0.0);
+        while let Some(item) = body.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => { yield FfmpegDlEvent::Done(Err(format!("download interrupted: {e}"))); return; }
+            };
+            if let Err(e) = writer.write_all(&chunk).await {
+                yield FfmpegDlEvent::Done(Err(format!("write error: {e}"))); return;
+            }
+            downloaded += chunk.len() as u64;
+            match total {
+                Some(t) if t > 0 => {
+                    let pct = (downloaded * 100 / t) as i32;
+                    if pct != last_pct {
+                        last_pct = pct;
+                        yield FfmpegDlEvent::Progress(downloaded as f32 / t as f32);
+                    }
+                }
+                _ => {
+                    // Unknown size: nudge the bar every ~2 MB with a negative marker.
+                    if downloaded - last_bytes >= 2_000_000 {
+                        last_bytes = downloaded;
+                        yield FfmpegDlEvent::Progress(-1.0);
+                    }
+                }
+            }
+        }
+        if let Err(e) = writer.flush().await {
+            yield FfmpegDlEvent::Done(Err(format!("finishing the download: {e}"))); return;
+        }
+        drop(writer);
+
+        yield FfmpegDlEvent::Extracting;
+        let zip_path = tmp_zip.clone();
+        let out = install.clone();
+        let extracted = tokio::task::spawn_blocking(move || extract_ffmpeg(&zip_path, &out)).await;
+        let _ = tokio::fs::remove_file(&tmp_zip).await;
+        match extracted {
+            Ok(Ok(path)) => yield FfmpegDlEvent::Done(Ok(path)),
+            Ok(Err(e)) => yield FfmpegDlEvent::Done(Err(e)),
+            Err(e) => yield FfmpegDlEvent::Done(Err(format!("the extract step failed: {e}"))),
+        }
+    }
+}
+
+/// Decodes the embedded PNG logo into a window icon. Returns None if decoding fails, so a
+/// bad asset never stops the app from starting.
+fn app_icon() -> Option<iced::window::Icon> {
+    let bytes = include_bytes!("assets/logo.png");
+    let decoder = png::Decoder::new(bytes.as_slice());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    // The asset is saved as 8-bit RGBA, which is exactly what from_rgba wants.
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    iced::window::icon::from_rgba(buf, info.width, info.height).ok()
+}
+
 pub fn run() -> iced::Result {
+    let window = iced::window::Settings {
+        size: iced::Size::new(1040.0, 680.0),
+        icon: app_icon(),
+        ..Default::default()
+    };
     iced::application(App::boot, App::update, App::view)
         .title("Crunchyroll Downloader")
         .theme(theme_of)
@@ -1377,7 +2201,7 @@ pub fn run() -> iced::Result {
         .font(include_bytes!("assets/Roboto_700Bold.ttf").as_slice())
         .font(include_bytes!("assets/MaterialSymbolsRounded-400.ttf").as_slice())
         .default_font(iced::Font::with_name("Roboto"))
-        .window_size((1040.0, 680.0))
+        .window(window)
         .run()
 }
 
@@ -1408,6 +2232,7 @@ mod tests {
             audio_locale: "ja-JP".into(),
             title: "T".into(),
             availability_starts: String::new(),
+            is_movie: false,
         };
         let item = |state| QueueItem { ep: ep.clone(), label: String::new(), state };
         let queue = vec![

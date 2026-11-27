@@ -154,8 +154,13 @@ pub fn parse_url(url: &str) -> Option<(&str, &str)> {
     let trimmed = url.trim_end_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
     for (i, p) in parts.iter().enumerate() {
-        if (*p == "watch" || *p == "series") && i + 1 < parts.len() {
-            return Some((p, parts[i + 1]));
+        if i + 1 < parts.len() {
+            match *p {
+                "watch" | "series" => return Some((p, parts[i + 1])),
+                // Films are grouped in movie listings. Both spellings are accepted.
+                "movie_listing" | "movie-listing" => return Some(("movie_listing", parts[i + 1])),
+                _ => {}
+            }
         }
     }
     None
@@ -169,6 +174,18 @@ mod tests {
     fn sanitizes() {
         assert_eq!(sanitize_filename(""), "Unknown");
         assert_eq!(sanitize_filename("a/b:c?."), "a_b_c_");
+    }
+
+    #[test]
+    fn parses_movie_listing_urls() {
+        assert_eq!(
+            parse_url("https://www.crunchyroll.com/movie_listing/GY8VM8MWY"),
+            Some(("movie_listing", "GY8VM8MWY"))
+        );
+        assert_eq!(
+            parse_url("https://www.crunchyroll.com/movie-listing/GY8VM8MWY/slug"),
+            Some(("movie_listing", "GY8VM8MWY"))
+        );
     }
 
     #[test]

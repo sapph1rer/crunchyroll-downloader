@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod backoff;
+pub mod browse;
 pub mod cdm;
 pub mod cenc;
 pub mod download;

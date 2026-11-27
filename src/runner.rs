@@ -32,9 +32,18 @@ impl Plan {
 /// URL, as in Go. Episode results are recorded in `summary`.
 pub async fn process_url(plan: &Plan, url: &str, summary: &mut Summary) -> Result<()> {
     let Some((kind, id)) = parse_url(url) else {
-        ui::warn(format!("Invalid URL (must be /watch/ or /series/): {url}"));
+        ui::warn(format!("Invalid URL (must be /watch/, /series/ or /movie_listing/): {url}"));
         return Ok(());
     };
+
+    if kind == "movie_listing" {
+        let (_title, films) = plan.api.movie_listing(id, &plan.primary_audio, &plan.primary_subs).await?;
+        if films.is_empty() {
+            ui::warn("This movie listing has no films available.");
+        }
+        download_season(&plan.api, &plan.backoff, &plan.opts, &films, summary).await;
+        return Ok(());
+    }
 
     if kind == "watch" {
         let info = plan.api.episode_info(id).await?;

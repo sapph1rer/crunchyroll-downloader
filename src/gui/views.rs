@@ -2,8 +2,8 @@
 //! Download, Settings and Logs pages.
 
 use crate::app::{
-    page_scroll_id, password_input_id, tally, App, DropdownId, FfmpegState, LangField, Message, QueueItem, Screen, Tab,
-    NAV_GAP, NAV_H,
+    page_scroll_id, password_input_id, tally, App, DropdownId, Poster, FfmpegDlEvent, FfmpegState, LangField, LoginPhase, Message,
+    QueueItem, Screen, Tab, NAV_GAP, NAV_H,
 };
 use crate::dropdown::Dropdown;
 use crate::engine;
@@ -12,7 +12,7 @@ use crunchyroll_downloader::api::SeasonEpisode;
 use crunchyroll_downloader::log::Kind;
 use crunchyroll_downloader::progress::{Bar, EpisodeState};
 use crunchyroll_downloader::util::{parse_langs, track_title};
-use crunchyroll_downloader::vault::Settings;
+use crunchyroll_downloader::vault::{self, Settings};
 use iced::font::Font;
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{button, checkbox, column, container, progress_bar, row, scrollable, stack, text, text_input, toggler, Id, Space};
@@ -71,6 +71,16 @@ fn lang_options() -> Vec<Opt> {
     v
 }
 
+fn autolock_options() -> Vec<Opt> {
+    vec![
+        opt("5", "5 minutes"),
+        opt("10", "10 minutes"),
+        opt("20", "20 minutes"),
+        opt("30", "30 minutes"),
+        opt("0", "Never"),
+    ]
+}
+
 fn settings_of(app: &App) -> Option<&Settings> {
     app.vault.as_ref().map(|v| &v.contents.settings)
 }
@@ -91,16 +101,34 @@ pub fn dropdown_options(app: &App, id: DropdownId) -> Vec<Opt> {
         DropdownId::Audio => audio_options(),
         DropdownId::Lang(field) => {
             let chosen = settings_of(app).map(|st| parse_langs(lang_value(st, field))).unwrap_or_default();
-            lang_options().into_iter().filter(|o| !chosen.iter().any(|c| c == &o.value)).collect()
+            let query = app.dropdown_filter.trim().to_lowercase();
+            lang_options()
+                .into_iter()
+                .filter(|o| !chosen.iter().any(|c| c == &o.value))
+                .filter(|o| {
+                    query.is_empty()
+                        || o.label.to_lowercase().contains(&query)
+                        || o.value.to_lowercase().contains(&query)
+                })
+                .collect()
         }
+        DropdownId::AutoLock => autolock_options(),
+        DropdownId::Genre => std::iter::once(opt("", "All genres"))
+            .chain(app.browse.genres.iter().map(|g| Opt { value: g.id.clone(), label: g.title.clone() }))
+            .collect(),
     }
 }
 
 /// The option the keyboard starts on when a list opens: the current value, or the first option.
 pub fn highlight_for_open(app: &App, id: DropdownId) -> usize {
+    if id == DropdownId::Genre {
+        let current = app.browse.genre.as_deref().unwrap_or("");
+        return dropdown_options(app, id).iter().position(|o| o.value == current).unwrap_or(0);
+    }
     let current = match (id, settings_of(app)) {
         (DropdownId::Video, Some(st)) => st.video_quality.as_str(),
         (DropdownId::Audio, Some(st)) => st.audio_quality.as_str(),
+        (DropdownId::AutoLock, Some(st)) => st.auto_lock_minutes.as_str(),
         _ => return 0,
     };
     dropdown_options(app, id)
@@ -195,7 +223,20 @@ fn select<'a>(app: &App, id: DropdownId, shown: String, selected: &str, options:
             .style(theme::scroll)
             .width(Length::Fill)
             .height(Length::Fixed(natural * t));
-        container(list).width(Length::Fill).style(theme::menu_surface(t)).into()
+        // Language lists get a search box at the top — there are too many languages to scan.
+        // It appears only once the list is fully open, so it doesn't flicker during the animation.
+        let is_lang = matches!(id, DropdownId::Lang(_));
+        if is_lang && t >= 0.999 {
+            let search = text_input("Search language…", &app.dropdown_filter)
+                .on_input(Message::DropdownFilter)
+                .style(theme::field)
+                .size(14)
+                .padding(10);
+            let content = column![search, list].spacing(6).padding(6);
+            container(content).width(Length::Fill).style(theme::menu_surface(t)).into()
+        } else {
+            container(list).width(Length::Fill).style(theme::menu_surface(t)).into()
+        }
     } else {
         Space::new().into()
     };
@@ -354,12 +395,12 @@ fn nav<'a>(app: &App, tab: Tab, glyph: char, label: &'a str) -> Element<'a, Mess
     .into()
 }
 
-/// The three navigation items, with the pill drawn behind them at the animated position.
+/// The four navigation items, with the pill drawn behind them at the animated position.
 fn nav_rail(app: &App) -> Element<'_, Message> {
     let y = app.nav_y(app.now);
     // Three items plus the gaps between them. The stack needs an explicit height,
     // otherwise it is sized by its first layer and clips the other items.
-    let total = 3.0 * NAV_H + 2.0 * NAV_GAP;
+    let total = 4.0 * NAV_H + 3.0 * NAV_GAP;
     let pill = column![
         Space::new().height(Length::Fixed(y)),
         container(Space::new())
@@ -371,6 +412,7 @@ fn nav_rail(app: &App) -> Element<'_, Message> {
     .height(Length::Fixed(total));
     let items = column![
         nav(app, Tab::Main, theme::HOME, "Download"),
+        nav(app, Tab::Browse, theme::EXPLORE, "Browse"),
         nav(app, Tab::Settings, theme::SETTINGS, "Settings"),
         nav(app, Tab::Logs, theme::DESCRIPTION, "Logs"),
     ]
@@ -404,6 +446,7 @@ fn shell(app: &App) -> Element<'_, Message> {
 
     let (title, subtitle) = match app.tab {
         Tab::Main => ("Download", "Fetch the episode list, pick what you want, then download"),
+        Tab::Browse => ("Browse", "Find a series, open it, and download episodes, seasons or everything"),
         Tab::Settings => ("Settings", "Saved encrypted on this computer"),
         Tab::Logs => ("Logs", "Every step the downloader takes"),
     };
@@ -424,6 +467,7 @@ fn shell(app: &App) -> Element<'_, Message> {
 
     let body = match app.tab {
         Tab::Main => main_tab(app),
+        Tab::Browse => browse_tab(app),
         Tab::Settings => settings_tab(app),
         Tab::Logs => logs_tab(app),
     };
@@ -443,6 +487,7 @@ fn shell(app: &App) -> Element<'_, Message> {
         container(rail).style(theme::rail).height(Length::Fill),
         scrollable(content)
             .id(page_scroll_id())
+            .on_scroll(Message::PageScrolled)
             .direction(theme::scrollbar())
             .style(theme::scroll)
             .width(Length::Fill)
@@ -527,88 +572,190 @@ fn status_pill(label: &str, value: &str, ok: bool) -> Element<'static, Message> 
     .into()
 }
 
-/// One row of the setup check: a status mark, the item and what it needs, and an action.
-fn check_row(done: bool, title: &'static str, detail: String, action: Option<(&'static str, Message)>) -> Element<'static, Message> {
-    let (glyph, color) = if done { (theme::CHECK, theme::success()) } else { (theme::INFO, theme::warning()) };
-    let mut line = row![
-        icon(glyph, 20.0).color(color),
-        column![
-            text(title).size(15).font(theme::medium()).color(theme::text()),
-            text(detail).size(13).color(theme::muted()),
-        ]
-        .spacing(2)
-        .width(Length::Fill),
+/// What a setup row is doing right now: finished, waiting on something in progress, or
+/// needing the user to act.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    Done,
+    Busy,
+    Todo,
+}
+
+/// One row of the setup check: a status mark, the item and what it needs, an optional
+/// widget under the text (a progress bar), and up to two actions — the main one filled in
+/// orange so the next step is always obvious, a secondary one as a quiet text button.
+fn setup_row<'a>(
+    state: RowState,
+    title: &'static str,
+    detail: String,
+    below: Option<Element<'a, Message>>,
+    secondary: Option<(&'static str, Message)>,
+    primary: Option<(&'static str, char, Message)>,
+) -> Element<'a, Message> {
+    let (glyph, color) = match state {
+        RowState::Done => (theme::CHECK, theme::success()),
+        RowState::Busy => (theme::HOURGLASS, theme::accent()),
+        RowState::Todo => (theme::INFO, theme::warning()),
+    };
+    let mut info = column![
+        text(title).size(15).font(theme::medium()).color(theme::text()),
+        text(detail).size(13).color(theme::muted()),
     ]
-    .spacing(12)
-    .align_y(Alignment::Center);
-    if let Some((label, message)) = action {
+    .spacing(3)
+    .width(Length::Fill);
+    if let Some(extra) = below {
+        info = info.push(container(extra).padding(Padding { top: 6.0, ..Padding::ZERO }));
+    }
+    let mut line = row![icon(glyph, 22.0).color(color), info].spacing(14).align_y(Alignment::Center);
+    if let Some((label, message)) = secondary {
         line = line.push(
             button(text(label).size(14).font(theme::medium()))
                 .on_press(message)
-                .style(theme::tonal)
-                .padding([10, 16]),
+                .style(theme::ghost)
+                .padding([10, 14]),
+        );
+    }
+    if let Some((label, glyph, message)) = primary {
+        line = line.push(
+            button(row![icon(glyph, 18.0), text(label).size(14).font(theme::medium())].spacing(8).align_y(Alignment::Center))
+                .on_press(message)
+                .style(theme::filled)
+                .padding([10, 18]),
         );
     }
     line.into()
 }
 
-/// Guidance for what a download still needs: the etp_rt cookie, the Widevine device and
-/// ffmpeg. It is shown until all three are ready.
+/// A labelled progress bar for the ffmpeg download, used on both the Download page and in
+/// Settings so the two always look the same.
+fn ffmpeg_progress<'a>(event: &FfmpegDlEvent) -> Option<Element<'a, Message>> {
+    match event {
+        FfmpegDlEvent::Progress(p) => Some(progress_bar(0.0..=1.0, p.max(0.0)).girth(6).style(theme::progress).into()),
+        FfmpegDlEvent::Extracting => Some(progress_bar(0.0..=1.0, 1.0).girth(6).style(theme::progress).into()),
+        FfmpegDlEvent::Done(_) => None,
+    }
+}
+
+/// Guidance for what a download still needs: a Crunchyroll login, the Widevine device and
+/// ffmpeg. Each row offers the one action that fixes it. Shown until all three are ready.
 fn setup_check(app: &App) -> Option<Element<'_, Message>> {
     let secrets = &app.vault.as_ref()?.contents.secrets;
-    let cookie = !secrets.etp_rt.is_empty();
+    let signed_in = !secrets.etp_rt.is_empty() && !app.login_expired;
     let device = secrets.has_device();
-    let (ffmpeg_ok, ffmpeg_detail) = match &app.ffmpeg {
-        FfmpegState::Ready(path) => (true, format!("Found at {}", path.display())),
-        FfmpegState::Checking => (false, "Checking ffmpeg...".to_string()),
-        FfmpegState::Unknown => (false, "Not checked yet".to_string()),
-        FfmpegState::Broken(why) => (false, why.clone()),
-    };
-    if cookie && device && ffmpeg_ok {
+    let ffmpeg_ok = matches!(app.ffmpeg, FfmpegState::Ready(_));
+    if signed_in && device && ffmpeg_ok && app.login_busy.is_none() {
         return None;
     }
-    let rows = column![
-        check_row(
-            cookie,
-            "etp_rt cookie",
-            if cookie {
-                "Saved".to_string()
-            } else {
-                "Paste the etp_rt value from your crunchyroll.com cookies".to_string()
-            },
-            (!cookie).then_some(("Set up", Message::GoSetup)),
+    let ready = [signed_in, device, ffmpeg_ok].iter().filter(|b| **b).count();
+
+    // Crunchyroll account.
+    let account = match app.login_busy {
+        Some(LoginPhase::Waiting) => setup_row(
+            RowState::Busy,
+            "Crunchyroll account",
+            "Sign in with your email and password in the login window. It closes by itself.".into(),
+            None,
+            None,
+            None,
         ),
-        check_row(
-            device,
+        Some(LoginPhase::Verifying) => setup_row(
+            RowState::Busy,
+            "Crunchyroll account",
+            "Checking your login with Crunchyroll…".into(),
+            None,
+            None,
+            None,
+        ),
+        None if signed_in => setup_row(RowState::Done, "Crunchyroll account", "Signed in".into(), None, None, None),
+        None if app.login_expired => setup_row(
+            RowState::Todo,
+            "Crunchyroll account",
+            "Your login expired. Sign in again to keep downloading.".into(),
+            None,
+            None,
+            Some(("Log in", theme::LOGIN, Message::BrowserLogin)),
+        ),
+        None => setup_row(
+            RowState::Todo,
+            "Crunchyroll account",
+            "Sign in once with your Crunchyroll email and password. The login is saved encrypted.".into(),
+            None,
+            Some(("Paste cookie", Message::GoSetup)),
+            Some(("Log in", theme::LOGIN, Message::BrowserLogin)),
+        ),
+    };
+
+    // Widevine device.
+    let widevine = if device {
+        setup_row(RowState::Done, "Widevine device", "Added".into(), None, None, None)
+    } else {
+        setup_row(
+            RowState::Todo,
             "Widevine device",
-            if device {
-                "Saved".to_string()
-            } else {
-                "Add client_id.bin and private_key.pem, or one .wvd file".to_string()
-            },
-            (!device).then_some(("Set up", Message::GoSetup)),
-        ),
-        check_row(
-            ffmpeg_ok,
+            "Unlocks the video. Add client_id.bin + private_key.pem, or one .wvd file.".into(),
+            None,
+            None,
+            Some(("Add device", theme::FOLDER, Message::GoSetup)),
+        )
+    };
+
+    // ffmpeg: one click downloads and installs it, with live progress right here.
+    let ffmpeg_row = match (&app.ffmpeg_dl, &app.ffmpeg) {
+        (_, FfmpegState::Ready(path)) => {
+            setup_row(RowState::Done, "ffmpeg", format!("Ready · {}", path.display()), None, None, None)
+        }
+        (Some(ev @ FfmpegDlEvent::Progress(p)), _) => setup_row(
+            RowState::Busy,
             "ffmpeg",
-            ffmpeg_detail,
-            (!ffmpeg_ok).then_some(("Open Settings", Message::Tab(Tab::Settings))),
+            if *p >= 0.0 {
+                format!("Downloading… {}%", (p * 100.0).round() as i32)
+            } else {
+                "Downloading…".to_string()
+            },
+            ffmpeg_progress(ev),
+            None,
+            None,
         ),
+        (Some(ev @ FfmpegDlEvent::Extracting), _) => {
+            setup_row(RowState::Busy, "ffmpeg", "Installing…".into(), ffmpeg_progress(ev), None, None)
+        }
+        (Some(FfmpegDlEvent::Done(Err(e))), _) => setup_row(
+            RowState::Todo,
+            "ffmpeg",
+            format!("Download failed: {e}"),
+            None,
+            Some(("Choose file", Message::PickFfmpeg)),
+            Some(("Try again", theme::DOWNLOAD, Message::DownloadFfmpeg)),
+        ),
+        (_, FfmpegState::Checking) => setup_row(RowState::Busy, "ffmpeg", "Checking…".into(), None, None, None),
+        _ => setup_row(
+            RowState::Todo,
+            "ffmpeg",
+            "Joins video and audio into the finished file. One click downloads and installs it.".into(),
+            None,
+            Some(("Choose file", Message::PickFfmpeg)),
+            Some(("Download", theme::DOWNLOAD, Message::DownloadFfmpeg)),
+        ),
+    };
+
+    let head = row![
+        container(section_head(theme::INFO, "Before your first download", "Everything is stored encrypted on this PC"))
+            .width(Length::Fill),
+        container(text(format!("{ready} of 3 ready")).size(13).font(theme::medium()).color(theme::accent()))
+            .padding([5, 12])
+            .style(theme::badge(theme::accent())),
     ]
-    .spacing(14);
-    Some(card(
-        column![
-            section_head(theme::INFO, "Before your first download", "Each item is stored encrypted in this vault"),
-            rows,
-        ]
-        .spacing(18),
-    ))
+    .align_y(Alignment::Center);
+
+    Some(card(column![head, column![account, widevine, ffmpeg_row].spacing(16)].spacing(20)))
 }
 
 /// One season: a checkbox that selects all of its episodes, the count picked, and an
 /// expander that shows the episodes.
 fn season_block<'a>(app: &'a App, g: &'a engine::SeasonGroup) -> Element<'a, Message> {
     let number = g.number;
+    // A movie listing's films arrive as one group; label it as films, not "Season 0".
+    let films = !g.episodes.is_empty() && g.episodes.iter().all(|e| e.is_movie);
     let total = g.episodes.len();
     let picked = g.episodes.iter().filter(|e| app.picked.contains(&e.id)).count();
     let all = total > 0 && picked == total;
@@ -619,8 +766,13 @@ fn season_block<'a>(app: &'a App, g: &'a engine::SeasonGroup) -> Element<'a, Mes
             .style(theme::check),
         button(
             column![
-                text(format!("Season {number}")).size(16).font(theme::medium()).color(theme::text()),
-                text(format!("{picked} of {total} episodes selected")).size(13).color(theme::muted()),
+                text(if films { (if total == 1 { "Film" } else { "Films" }).to_string() } else { format!("Season {number}") })
+                    .size(16)
+                    .font(theme::medium())
+                    .color(theme::text()),
+                text(format!("{picked} of {total} {} selected", if films { "film(s)" } else { "episodes" }))
+                    .size(13)
+                    .color(theme::muted()),
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -629,6 +781,14 @@ fn season_block<'a>(app: &'a App, g: &'a engine::SeasonGroup) -> Element<'a, Mes
         .style(theme::ghost)
         .padding([8, 10])
         .width(Length::Fill),
+        button(
+            row![icon(theme::DOWNLOAD, 16.0), text(if films { "All" } else { "Season" }).size(13).font(theme::medium())]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .on_press_maybe((!app.running && !app.fetching).then_some(Message::DownloadSeason(number)))
+        .style(theme::tonal)
+        .padding([8, 12]),
         button(icon(if open { theme::EXPAND_LESS } else { theme::EXPAND_MORE }, 22.0).color(theme::muted()))
             .on_press(Message::ToggleExpand(number))
             .style(theme::ghost)
@@ -655,18 +815,44 @@ fn season_block<'a>(app: &'a App, g: &'a engine::SeasonGroup) -> Element<'a, Mes
 /// One episode row with its checkbox.
 fn episode_row<'a>(app: &'a App, ep: &'a SeasonEpisode) -> Element<'a, Message> {
     let on = app.picked.contains(&ep.id);
+    let have = app.downloaded.contains(&ep.id);
     let id = ep.id.clone();
-    row![
+    let mut line = row![
         checkbox(on)
             .on_toggle(move |b| Message::ToggleEpisode(id.clone(), b))
             .style(theme::check),
-        text(format!("E{:02}", ep.episode_number)).size(14).color(theme::muted()).width(48),
-        text(ep.title.as_str()).size(15).color(theme::text()).width(Length::Fill),
+        text(if ep.is_movie { "Film".to_string() } else { format!("E{:02}", ep.episode_number) })
+            .size(14)
+            .color(theme::muted())
+            .width(48),
+        text(ep.title.as_str())
+            .size(15)
+            .color(if have { theme::muted() } else { theme::text() })
+            .width(Length::Fill),
     ]
     .spacing(12)
     .align_y(Alignment::Center)
-    .padding([10, 12])
-    .into()
+    .padding([10, 12]);
+    if have {
+        // Already in the output folder at this quality; downloading again would be skipped.
+        line = line.push(
+            container(
+                row![icon(theme::CHECK, 14.0).color(theme::success()), text("Downloaded").size(12).font(theme::medium())]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+            )
+            .padding([3, 10])
+            .style(theme::badge(theme::success())),
+        );
+    }
+    // One click downloads just this episode.
+    line = line.push(
+        button(icon(theme::DOWNLOAD, 18.0))
+            .on_press_maybe((!app.running && !app.fetching).then_some(Message::DownloadOne(ep.id.clone())))
+            .style(theme::ghost)
+            .padding(6),
+    );
+    line.into()
 }
 
 /// One row of the queue: the episode, its state, and the action that state allows.
@@ -744,7 +930,7 @@ fn queue_card(app: &App) -> Element<'_, Message> {
             .spacing(8)
             .align_y(Alignment::Center),
     )
-    .on_press_maybe(app.last_output.is_some().then_some(Message::OpenOutput))
+    .on_press(Message::OpenOutput)
     .style(theme::tonal)
     .padding([10, 16]);
 
@@ -882,7 +1068,7 @@ fn main_tab(app: &App) -> Element<'_, Message> {
         page = page.push(queue_card(app));
     }
 
-    let url = text_input("Paste an episode or series link", &app.url)
+    let url = text_input("Paste an episode, series or movie link", &app.url)
         .on_input(Message::UrlInput)
         .on_submit(Message::FetchPressed)
         .style(theme::field)
@@ -898,46 +1084,320 @@ fn main_tab(app: &App) -> Element<'_, Message> {
     .padding([15, 26]);
     page = page.push(card(
         column![
-            section_head(theme::SEARCH, "Find episodes", "Paste a link and press Fetch to see its seasons and episodes"),
+            section_head(theme::SEARCH, "Find episodes", "Paste a link and press Fetch — or find titles in the Browse tab"),
             row![url, fetch].spacing(12).align_y(Alignment::Center),
         ]
         .spacing(20),
     ));
 
-    if let Some(catalog) = app.catalog.as_ref() {
-        let total: usize = catalog.seasons.iter().map(|g| g.episodes.len()).sum();
-        let picked = app.picked.len();
-        let all_on = total > 0 && picked == total;
-        let toolbar = row![
-            checkbox(all_on)
-                .label("Select all")
-                .on_toggle(Message::SelectAll)
-                .style(theme::check)
-                .text_size(15),
-            Space::new().width(Length::Fill),
-            text(format!("{picked} of {total} selected")).size(14).color(theme::muted()),
+    if let Some(list) = catalog_card(app) {
+        page = page.push(list);
+    }
+    page.into()
+}
+
+/// The loaded seasons and episodes with every way to download: one episode (its download
+/// button), a whole season (the season's button), ticked episodes, or everything (Select
+/// all). Used by the Download tab and the Browse detail page.
+fn catalog_card(app: &App) -> Option<Element<'_, Message>> {
+    let catalog = app.catalog.as_ref()?;
+    let busy = app.running;
+    let fetching = app.fetching;
+    let total: usize = catalog.seasons.iter().map(|g| g.episodes.len()).sum();
+    let picked = app.picked.len();
+    // "All" means every episode not already on disk (select-all leaves those unticked).
+    let wanted = total.saturating_sub(app.downloaded.len());
+    let all_on = wanted > 0 && app.picked.iter().filter(|id| !app.downloaded.contains(*id)).count() == wanted;
+    let toolbar = row![
+        checkbox(all_on)
+            .label("Select all")
+            .on_toggle(Message::SelectAll)
+            .style(theme::check)
+            .text_size(15),
+        Space::new().width(Length::Fill),
+        text(format!("{picked} of {total} selected")).size(14).color(theme::muted()),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+
+    let download = button(
+        row![icon(theme::DOWNLOAD, 20.0), text(format!("Download {picked}")).size(16).font(theme::medium())]
+            .spacing(10)
+            .align_y(Alignment::Center),
+    )
+    .on_press_maybe((picked > 0 && !busy && !fetching).then_some(Message::DownloadSelected))
+    .style(theme::filled)
+    .padding([15, 28]);
+
+    let list = column(catalog.seasons.iter().map(|g| season_block(app, g))).spacing(12);
+    Some(card(
+        column![
+            section_head(
+                theme::DESCRIPTION,
+                &catalog.title,
+                "Download one episode, a whole season, or tick several and press Download"
+            ),
+            toolbar,
+            list,
+            row![Space::new().width(Length::Fill), download].align_y(Alignment::Center),
         ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+        .spacing(18),
+    ))
+}
 
-        let download = button(
-            row![icon(theme::DOWNLOAD, 20.0), text(format!("Download {picked}")).size(16).font(theme::medium())]
-                .spacing(10)
-                .align_y(Alignment::Center),
-        )
-        .on_press_maybe((picked > 0 && !busy && !fetching).then_some(Message::DownloadSelected))
-        .style(theme::filled)
-        .padding([15, 28]);
+/// A poster image, or a placeholder box while it loads (or when there is none).
+fn poster_view<'a>(app: &'a App, url: Option<&String>, width: f32, height: f32) -> Element<'a, Message> {
+    let handle = url.and_then(|u| match app.browse.posters.get(u) {
+        Some(Poster::Ready(h)) => Some(h.clone()),
+        _ => None,
+    });
+    match handle {
+        Some(h) => iced::widget::image(h)
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .content_fit(iced::ContentFit::Cover)
+            .border_radius(10.0)
+            .into(),
+        None => container(icon(theme::MOVIE, 32.0).color(theme::outline()))
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .center_x(Length::Fixed(width))
+            .center_y(Length::Fixed(height))
+            .style(theme::poster_placeholder)
+            .into(),
+    }
+}
 
-        let list = column(catalog.seasons.iter().map(|g| season_block(app, g))).spacing(12);
-        page = page.push(card(
+/// Small facts under a title: seasons, episodes, year, sub/dub.
+fn series_facts(item: &engine::CatalogItem) -> String {
+    let mut parts = Vec::new();
+    if item.kind == engine::Kind::Movie {
+        parts.push("Movie".to_string());
+    }
+    if let Some(n) = item.season_count {
+        parts.push(format!("{n} season{}", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(n) = item.episode_count {
+        parts.push(format!("{n} ep"));
+    }
+    if let Some(y) = item.year {
+        parts.push(y.to_string());
+    }
+    match (item.subbed, item.dubbed) {
+        (true, true) => parts.push("Sub | Dub".into()),
+        (true, false) => parts.push("Sub".into()),
+        (false, true) => parts.push("Dub".into()),
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+const CARD_W: f32 = 168.0;
+const CARD_H: f32 = 252.0;
+
+/// One show in the Browse grid: poster, title, facts. Click opens its detail page.
+fn series_card<'a>(app: &'a App, item: &'a engine::CatalogItem) -> Element<'a, Message> {
+    button(
+        column![
+            poster_view(app, item.poster.as_ref(), CARD_W, CARD_H),
+            // Two lines at most; a longer title is clipped instead of running into the facts.
+            container(text(item.title.as_str()).size(14).font(theme::medium()).color(theme::text()))
+                .width(Length::Fixed(CARD_W))
+                .height(Length::Fixed(38.0))
+                .clip(true),
+            text(series_facts(item)).size(12).color(theme::muted()).width(Length::Fixed(CARD_W)),
+        ]
+        .spacing(6),
+    )
+    .on_press(Message::OpenSeries(item.clone()))
+    .style(theme::poster_card)
+    .padding(8)
+    .into()
+}
+
+/// The Browse tab: search and sort on top, a poster grid below, or a series' detail page.
+fn browse_tab(app: &App) -> Element<'_, Message> {
+    let signed_in = app.vault.as_ref().is_some_and(|v| !v.contents.secrets.etp_rt.is_empty());
+    if !signed_in || (app.login_expired && app.browse.items.is_empty()) {
+        return card(
             column![
-                section_head(theme::DESCRIPTION, &catalog.title, "Tick episodes, or a whole season, then press Download"),
-                toolbar,
-                list,
-                row![Space::new().width(Length::Fill), download].align_y(Alignment::Center),
+                section_head(theme::EXPLORE, "Browse Crunchyroll", "Sign in to see the catalog and search it"),
+                button(row![icon(theme::LOGIN, 18.0), text("Log in").size(15).font(theme::medium())].spacing(8).align_y(Alignment::Center))
+                    .on_press_maybe(app.login_busy.is_none().then_some(Message::BrowserLogin))
+                    .style(theme::filled)
+                    .padding([12, 22]),
             ]
             .spacing(18),
+        );
+    }
+    if let Some(selected) = app.browse.selected.as_ref() {
+        return series_detail(app, selected);
+    }
+
+    let b = &app.browse;
+    let mut search = row![
+        text_input("Search anime by title…", &b.query)
+            .on_input(Message::BrowseQueryInput)
+            .on_submit(Message::BrowseSubmit)
+            .style(theme::field)
+            .padding(14)
+            .size(16)
+            .width(Length::Fill),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if !b.query.is_empty() {
+        search = search.push(
+            button(icon(theme::CLOSE, 20.0))
+                .on_press(Message::BrowseClearSearch)
+                .style(theme::ghost)
+                .padding(12),
+        );
+    }
+
+    // Kind, order and genre only apply to the catalog; a search covers series and movies.
+    let searching = !b.query.trim().is_empty();
+    let mut sorts = row![].spacing(8).align_y(Alignment::Center);
+    if searching {
+        sorts = sorts.push(text(format!("Results for \"{}\" — series and movies", b.query.trim())).size(14).color(theme::muted()));
+    } else {
+        for show in engine::Show::ALL {
+            sorts = sorts.push(
+                button(text(show.label()).size(14).font(theme::medium()))
+                    .on_press(Message::BrowseShow(show))
+                    .style(theme::choice(b.show == show))
+                    .padding([8, 16]),
+            );
+        }
+        // A 1px rule between the groups (padding on the styled box would paint a block).
+        sorts = sorts.push(container(container(Space::new().width(1).height(22)).style(theme::divider)).padding([0, 6]));
+        for sort in engine::Sort::ALL {
+            sorts = sorts.push(
+                button(text(sort.label()).size(14).font(theme::medium()))
+                    .on_press(Message::BrowseSort(sort))
+                    .style(theme::choice(b.sort == sort))
+                    .padding([8, 16]),
+            );
+        }
+    }
+    sorts = sorts.push(Space::new().width(Length::Fill));
+    if b.loading {
+        sorts = sorts.push(text("Loading…").size(13).color(theme::muted()));
+    }
+    // The genre filter sits at the end of the same row once the catalog's genres are known.
+    if !searching && !b.genres.is_empty() {
+        let current = b.genre.clone().unwrap_or_default();
+        let options = dropdown_options(app, DropdownId::Genre);
+        let shown = options.iter().find(|o| o.value == current).map_or_else(|| "All genres".to_string(), |o| o.label.clone());
+        sorts = sorts.push(container(select(app, DropdownId::Genre, shown, &current, options)).width(Length::Fixed(240.0)));
+    }
+
+    let mut page = column![search, sorts].spacing(14);
+
+    if let Some(err) = &b.error {
+        page = page.push(card(
+            column![
+                text("Couldn't load the catalog").size(16).font(theme::medium()).color(theme::text()),
+                text(err.as_str()).size(13).color(theme::muted()),
+                row![
+                    button(text("Try again").size(14).font(theme::medium()))
+                        .on_press(Message::BrowseRetry)
+                        .style(theme::tonal)
+                        .padding([10, 16]),
+                ],
+            ]
+            .spacing(10),
+        ));
+    } else if b.items.is_empty() && !b.loading {
+        let msg = if searching { "Nothing matches that search." } else { "Nothing to show here." };
+        page = page.push(text(msg).size(14).color(theme::muted()));
+    }
+
+    // Cards flow into as many columns as the window fits.
+    let grid = row(b.items.iter().map(|item| series_card(app, item))).spacing(8).wrap().vertical_spacing(12);
+    page = page.push(grid);
+
+    // More catalog pages load on their own near the bottom; the button is a fallback.
+    if b.has_more() {
+        page = page.push(
+            container(
+                button(text(if b.loading { "Loading…" } else { "Load more" }).size(15).font(theme::medium()))
+                    .on_press_maybe((!b.loading).then_some(Message::BrowseMore))
+                    .style(theme::tonal)
+                    .padding([12, 28]),
+            )
+            .center_x(Length::Fill),
+        );
+    }
+    page.into()
+}
+
+/// A series' page: poster, title, description, then its seasons and episodes with every
+/// download option. Live progress shows here too, so the user never has to switch tabs.
+fn series_detail<'a>(app: &'a App, item: &'a engine::CatalogItem) -> Element<'a, Message> {
+    let back = button(
+        row![icon(theme::ARROW_BACK, 18.0), text("Back to Browse").size(14).font(theme::medium())]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .on_press(Message::BrowseBack)
+    .style(theme::ghost)
+    .padding([8, 12]);
+
+    let poster_url = item.poster_large.as_ref().or(item.poster.as_ref());
+    let description = if item.description.is_empty() { "No description." } else { item.description.as_str() };
+    let header = card(
+        row![
+            poster_view(app, poster_url, 200.0, 300.0),
+            column![
+                text(item.title.as_str()).size(26).font(theme::bold()).color(theme::text()),
+                text(series_facts(item)).size(14).color(theme::accent()).font(theme::medium()),
+                text(description).size(14).color(theme::muted()),
+            ]
+            .spacing(10)
+            .width(Length::Fill),
+        ]
+        .spacing(24),
+    );
+
+    let mut page = column![back, header].spacing(16);
+    if app.running {
+        page = page.push(progress_card(app));
+    }
+    if !app.queue.is_empty() {
+        page = page.push(queue_card(app));
+    }
+
+    let movie = item.kind == engine::Kind::Movie;
+    let loaded_here = app.catalog_series.as_deref() == Some(item.id.as_str());
+    if app.fetching {
+        page = page.push(card(
+            row![
+                icon_tile(theme::SEARCH, 22.0),
+                text(if movie { "Loading the film…" } else { "Loading seasons and episodes…" })
+                    .size(16)
+                    .font(theme::medium())
+                    .color(theme::text()),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        ));
+    } else if loaded_here {
+        if let Some(list) = catalog_card(app) {
+            page = page.push(list);
+        }
+    } else if app.running {
+        page = page.push(card(
+            text("The list loads when the current download finishes (or press Stop).")
+                .size(14)
+                .color(theme::muted()),
+        ));
+    } else {
+        page = page.push(card(
+            button(text(if movie { "Load film" } else { "Load episodes" }).size(15).font(theme::medium()))
+                .on_press(Message::OpenSeries(item.clone()))
+                .style(theme::filled)
+                .padding([12, 22]),
         ));
     }
     page.into()
@@ -1002,11 +1462,13 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
     let st = &v.contents.settings;
     let sec = &v.contents.secrets;
 
+    let out_dir = crate::app::resolve_output(st);
+    let default_dir = vault::default_output_dir();
     let downloads = settings_card(
         section_head(theme::FOLDER, "Downloads", "Where files go, and the pause between episodes"),
         column![
             row![
-                text_input("Output folder", &st.output_dir)
+                text_input(&default_dir.display().to_string(), &st.output_dir)
                     .on_input(Message::SetOutputDir)
                     .style(theme::field)
                     .padding(14)
@@ -1015,14 +1477,30 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
                     .on_press(Message::BrowseOutput)
                     .style(theme::tonal)
                     .padding([13, 18]),
+                button(text("Open").size(14).font(theme::medium()))
+                    .on_press(Message::OpenOutput)
+                    .style(theme::ghost)
+                    .padding([13, 14]),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
+            text(format!(
+                "Each series gets its own folder: {}\\<Series>\\<Series> S01E01 - <Title> [quality].mkv",
+                out_dir.display()
+            ))
+            .size(12)
+            .color(theme::muted()),
             text("Delay between episodes (for example 20s or 2m)").size(13).color(theme::muted()),
             text_input("0s", &st.download_delay)
                 .on_input(Message::SetDelay)
                 .style(theme::field)
                 .padding(14),
+            toggle_row(
+                "Notify me when downloads finish",
+                "A desktop notification when the whole queue is done",
+                st.notify_done,
+                Message::SetNotify,
+            ),
         ]
         .spacing(10),
     );
@@ -1041,11 +1519,28 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
         column![
             number_field(
                 "Segments at once (per track)",
-                "1 to 16, default 10",
+                "1 to 16, default 20",
                 &st.segment_workers,
                 Message::SetSegmentWorkers,
             ),
             number_field("Audio dubs at once", "1 to 4, default 2", &st.track_workers, Message::SetTrackWorkers),
+            {
+                let proxy_hint = if st.proxy_url.trim().is_empty() {
+                    "Direct connection (no proxy)"
+                } else {
+                    "API calls routed through proxy · CDN downloads always go direct"
+                };
+                column![
+                    number_field(
+                        "Proxy URL (API only, leave blank to disable)",
+                        "socks5://127.0.0.1:1080  or  http://user:pass@host:8080",
+                        &st.proxy_url,
+                        Message::SetProxyUrl,
+                    ),
+                    text(proxy_hint).size(12).color(theme::muted()),
+                ]
+                .spacing(4)
+            },
         ]
         .spacing(18),
     );
@@ -1066,12 +1561,59 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
     } else {
         format!("Chosen by you: {}", st.ffmpeg_path)
     };
+    // While a download runs (or just failed), show its status and a progress bar in place of
+    // the download button.
+    let downloading = matches!(app.ffmpeg_dl, Some(FfmpegDlEvent::Progress(_)) | Some(FfmpegDlEvent::Extracting));
+    let dl_ui: Element<'_, Message> = match &app.ffmpeg_dl {
+        Some(FfmpegDlEvent::Progress(p)) => {
+            let known = *p >= 0.0;
+            let label = if known {
+                format!("Downloading ffmpeg… {}%", (p * 100.0).round() as i32)
+            } else {
+                "Downloading ffmpeg…".to_string()
+            };
+            column![
+                text(label).size(13).color(theme::muted()),
+                progress_bar(0.0..=1.0, if known { *p } else { 0.0 }).girth(8).style(theme::progress),
+            ]
+            .spacing(6)
+            .into()
+        }
+        Some(FfmpegDlEvent::Extracting) => column![
+            text("Unpacking ffmpeg…").size(13).color(theme::muted()),
+            progress_bar(0.0..=1.0, 1.0).girth(8).style(theme::progress),
+        ]
+        .spacing(6)
+        .into(),
+        Some(FfmpegDlEvent::Done(Err(e))) => {
+            text(format!("Download failed: {e}")).size(13).color(theme::danger()).into()
+        }
+        _ => Space::new().into(),
+    };
+
+    // Offer the automatic download whenever ffmpeg isn't ready and nothing is downloading.
+    let download_btn: Element<'_, Message> = if !ff_ok && !downloading {
+        button(
+            row![icon(theme::DOWNLOAD, 18.0), text("Download ffmpeg").size(14).font(theme::medium())]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .on_press(Message::DownloadFfmpeg)
+        .style(theme::filled)
+        .padding([12, 18])
+        .into()
+    } else {
+        Space::new().into()
+    };
+
     let ffmpeg_card = settings_card(
-        section_head(theme::SEARCH, "ffmpeg", "Merges video and audio. Found automatically, or choose the file"),
+        section_head(theme::SEARCH, "ffmpeg", "Merges video and audio. Download it automatically, or choose the file"),
         column![
             status_pill("Status", ff_value, ff_ok),
             text(ff_detail).size(13).color(theme::muted()),
             text(ff_source).size(13).color(theme::muted()),
+            download_btn,
+            dl_ui,
             row![
                 button(row![icon(theme::FOLDER, 18.0), text("Choose ffmpeg").size(14).font(theme::medium())].spacing(8).align_y(Alignment::Center))
                     .on_press(Message::PickFfmpeg)
@@ -1087,14 +1629,32 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
         .spacing(12),
     );
 
+    let portable = vault::is_portable();
+    let ffmpeg_place = match &app.ffmpeg {
+        FfmpegState::Ready(p) => p.display().to_string(),
+        _ => "not installed yet".to_string(),
+    };
+    let storage = column![
+        text("Where things are stored").size(14).font(theme::medium()).color(theme::text()),
+        text(format!("Vault (login, device, settings — encrypted): {}", app.vault_path.display()))
+            .size(12)
+            .color(theme::muted()),
+        text(format!("Videos: {}", out_dir.display())).size(12).color(theme::muted()),
+        text(format!("ffmpeg: {ffmpeg_place}")).size(12).color(theme::muted()),
+        text("Temporary pieces go to your Windows temp folder and are removed when each episode finishes (leftovers are cleaned at startup).")
+            .size(12)
+            .color(theme::muted()),
+    ]
+    .spacing(4);
     let advanced = settings_card(
-        section_head(theme::INFO, "Security and advanced", "Auto-lock and troubleshooting"),
+        section_head(theme::INFO, "Security and advanced", "Auto-lock, portable mode and troubleshooting"),
         column![
-            number_field(
-                "Lock after minutes without activity",
-                "0 turns it off, default 10",
-                &st.auto_lock_minutes,
-                Message::SetAutoLock,
+            quality_pick(app, DropdownId::AutoLock, "Sleep (lock) after inactivity", &st.auto_lock_minutes),
+            toggle_row(
+                "Portable mode",
+                "Keep the vault (and a downloaded ffmpeg) next to the program, so the folder works from a USB drive",
+                portable,
+                Message::SetPortable,
             ),
             toggle_row(
                 "Debug output",
@@ -1102,6 +1662,7 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
                 st.debug,
                 Message::SetDebug,
             ),
+            storage,
         ]
         .spacing(18),
     );
@@ -1178,24 +1739,75 @@ fn settings_tab(app: &App) -> Element<'_, Message> {
 fn setup_panel(app: &App) -> Element<'_, Message> {
     let fade = app.setup_anim.interpolate_with(|v| v, app.now);
     let slide = app.setup_anim.interpolate_with(|v| 14.0 * (1.0 - v), app.now);
-    let etp = column![
-        text(
-            "Log in at crunchyroll.com, open the browser's developer tools (F12), go to the cookies for crunchyroll.com, \
-             and copy the Value of etp_rt. It is stored encrypted and never shown again."
-        )
-        .size(13)
-        .color(theme::muted()),
-        row![
-            secret_field("etp_rt value", &app.etp_draft, app.show_secret, Message::EtpDraftInput, Message::SaveEtp, None),
-            button(text("Save").size(14).font(theme::medium()))
-                .on_press(Message::SaveEtp)
-                .style(theme::filled)
-                .padding([12, 18]),
+    let has_login = app.vault.as_ref().is_some_and(|v| !v.contents.secrets.etp_rt.is_empty());
+    let busy = app.login_busy;
+    let etp: Element<'_, Message> = if has_login && !app.login_expired && busy.is_none() {
+        // Signed in: say so plainly, and offer the two things a user might want next.
+        column![
+            row![
+                icon(theme::CHECK, 20.0).color(theme::success()),
+                text("Signed in to Crunchyroll").size(15).font(theme::medium()).color(theme::text()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            text("Your login is stored encrypted in this vault. Only the login cookie is kept — never your password.")
+                .size(13)
+                .color(theme::muted()),
+            row![
+                button(row![icon(theme::LOGIN, 18.0), text("Switch account").size(14).font(theme::medium())].spacing(8).align_y(Alignment::Center))
+                    .on_press(Message::BrowserLogin)
+                    .style(theme::tonal)
+                    .padding([10, 16]),
+                button(row![icon(theme::LOGOUT, 18.0), text("Sign out").size(14).font(theme::medium())].spacing(8).align_y(Alignment::Center))
+                    .on_press(Message::SignOut)
+                    .style(theme::danger_tonal)
+                    .padding([10, 16]),
+            ]
+            .spacing(8),
         ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    ]
-    .spacing(10);
+        .spacing(10)
+        .into()
+    } else {
+        let (label, press) = match busy {
+            Some(LoginPhase::Waiting) => ("Waiting for you to sign in…", None),
+            Some(LoginPhase::Verifying) => ("Checking your login…", None),
+            None => ("Log in to Crunchyroll", Some(Message::BrowserLogin)),
+        };
+        let intro = if app.login_expired {
+            "Your login expired. Sign in again with your Crunchyroll email and password."
+        } else {
+            "Sign in with your Crunchyroll email and password in a secure login window. \
+             Only the login cookie is saved (encrypted) — never your password."
+        };
+        column![
+            text(intro).size(13).color(theme::muted()),
+            button(
+                row![
+                    icon(if busy.is_some() { theme::HOURGLASS } else { theme::LOGIN }, 18.0),
+                    text(label).size(15).font(theme::medium())
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+            )
+            .on_press_maybe(press)
+            .style(theme::filled)
+            .padding([12, 22]),
+            text("Advanced: paste the etp_rt cookie yourself (F12 → Application → Cookies → crunchyroll.com). It is checked before it is saved.")
+                .size(12)
+                .color(theme::muted()),
+            row![
+                secret_field("etp_rt value", &app.etp_draft, app.show_secret, Message::EtpDraftInput, Message::SaveEtp, None),
+                button(text("Check & save").size(14).font(theme::medium()))
+                    .on_press_maybe(busy.is_none().then_some(Message::SaveEtp))
+                    .style(theme::tonal)
+                    .padding([12, 18]),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10)
+        .into()
+    };
     let device = column![
         text("Widevine device: either client_id.bin plus private_key.pem, or one .wvd file (a .wvd takes priority). \
               Both are stored encrypted.")
@@ -1239,22 +1851,28 @@ fn setup_panel(app: &App) -> Element<'_, Message> {
 /// One log line: a level pill, the time, then the message, on a soft rounded row.
 fn log_line(e: &logs::Entry) -> Element<'_, Message> {
     let color = kind_color(e.kind);
-    container(
-        row![
-            container(text(logs::label(e.kind)).size(10).font(theme::bold()))
-                .padding([3, 0])
-                .center_x(Length::Fixed(60.0))
-                .style(theme::badge(color)),
-            text(e.time.as_str()).size(12).color(theme::muted()).width(56),
-            text(e.text.as_str()).size(13).color(theme::text()).width(Length::Fill),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )
-    .padding([8, 12])
-    .width(Length::Fill)
-    .style(theme::log_row)
+    // Flat row: a small level tag, a timestamp, then the message. No box, no fill — rows are
+    // separated by thin dividers instead, so the log reads as one open list.
+    row![
+        container(text(logs::label(e.kind)).size(10).font(theme::bold()))
+            .padding([2, 0])
+            .center_x(Length::Fixed(52.0))
+            .style(theme::badge(color)),
+        text(e.time.as_str()).size(12).color(theme::muted()).width(56),
+        text(e.text.as_str()).size(13).color(theme::text()).width(Length::Fill),
+    ]
+    .spacing(12)
+    .padding([7, 4])
+    .align_y(Alignment::Center)
     .into()
+}
+
+/// A hairline divider between flat log rows.
+fn log_divider<'a>() -> Element<'a, Message> {
+    container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(theme::divider)
+        .into()
 }
 
 fn logs_tab(app: &App) -> Element<'_, Message> {
@@ -1273,8 +1891,8 @@ fn logs_tab(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Center);
 
-    let lines: Element<'_, Message> = if app.logs.is_empty() {
-        column![
+    if app.logs.is_empty() {
+        let empty = column![
             icon(theme::DESCRIPTION, 40.0).color(theme::muted()),
             text("No log yet").size(18).color(theme::text()).font(theme::medium()),
             text("Start a download on the Download page and every step will be listed here, with the reason for each decision and any fix to try.")
@@ -1283,25 +1901,29 @@ fn logs_tab(app: &App) -> Element<'_, Message> {
         ]
         .spacing(10)
         .align_x(Alignment::Center)
-        .width(Length::Fill)
-        .into()
-    } else {
-        // Only the newest lines are drawn, which keeps redraws light. The export has them all.
-        let hidden = count.saturating_sub(LOG_VIEW);
-        let mut body = column![].spacing(8);
-        if hidden > 0 {
-            body = body.push(
-                text(format!("Showing the last {LOG_VIEW} of {count} lines. Export saves all of them."))
-                    .size(12)
-                    .color(theme::muted()),
-            );
+        .width(Length::Fill);
+        return column![toolbar, container(empty).padding([48, 12]).width(Length::Fill).center_x(Length::Fill)]
+            .spacing(12)
+            .into();
+    }
+
+    // Only the newest lines are drawn, which keeps redraws light. The export has them all.
+    let hidden = count.saturating_sub(LOG_VIEW);
+    let shown = count - hidden;
+    let mut body = column![].spacing(0);
+    if hidden > 0 {
+        body = body.push(
+            text(format!("Showing the last {LOG_VIEW} of {count} lines. Export saves all of them."))
+                .size(12)
+                .color(theme::muted()),
+        );
+    }
+    let mut list = column![].spacing(0);
+    for (i, e) in app.logs.iter().skip(hidden).enumerate() {
+        list = list.push(log_line(e));
+        if i + 1 < shown {
+            list = list.push(log_divider());
         }
-        body.push(column(app.logs.iter().skip(hidden).map(log_line)).spacing(6)).into()
-    };
-    column![
-        toolbar,
-        container(lines).padding(12).width(Length::Fill).style(theme::card),
-    ]
-    .spacing(12)
-    .into()
+    }
+    column![toolbar, body.push(list)].spacing(10).into()
 }
